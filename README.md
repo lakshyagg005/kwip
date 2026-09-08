@@ -1,36 +1,88 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# KWIP
 
-## Getting Started
+KWIP turns YouTube videos into structured visual knowledge.
 
-First, run the development server:
+KWIP processes YouTube videos and extracts grounded, high-signal insights into clean visual formats designed for rapid comprehension and sharing.
 
+> **Note**: KWIP currently supports YouTube videos up to 30 minutes in length.
+
+---
+
+## Capabilities
+
+- **Visual Brief**: Comprehensive interactive canvas featuring core thesis, key concepts, quantitative metrics, verbatim quotes, and actionable takeaways.
+- **Social Carousel**: Multi-slide visual carousel tailored for sharing structured knowledge on social platforms.
+- **PDF & PNG Exports**: Clean, multi-page vector PDF summaries and high-resolution image exports.
+- **Personal Knowledge Library**: Save, search, filter, and review analyzed videos with ease.
+- **Fact-Grounded Analysis**: Content-first extraction pipeline built for high accuracy and minimal noise.
+
+---
+
+## Tech Stack
+
+- **Framework**: [Next.js 15](https://nextjs.org/) (App Router, TypeScript)
+- **Styling**: Tailwind CSS, Lucide Icons, Canvas & HTML5 rendering
+- **Database & Auth**: [Supabase](https://supabase.com/)
+- **AI Infrastructure**: Multi-provider pipeline (Groq, OpenRouter, NVIDIA NIM)
+- **Export Engine**: html2canvas & jsPDF custom rendering pipeline
+
+---
+
+## Environment Setup
+
+Follow these steps to run KWIP locally:
+
+### 1. Clone the repository
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+git clone https://github.com/lakshyagg005/kwip.git
+cd kwip
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+### 2. Install dependencies
+```bash
+npm install
+```
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+### 3. Configure environment variables
+Create a `.env.local` file in the project root based on `.env.example`:
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+cp .env.example .env.local
+```
 
-## Learn More
+Fill in your configuration:
 
-To learn more about Next.js, take a look at the following resources:
+```env
+# AI Providers (at least one key required)
+GROQ_API_KEY=your_groq_key
+OPENROUTER_API_KEY=your_openrouter_key
+NVIDIA_API_KEY=your_nvidia_key
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+# Supabase
+NEXT_PUBLIC_SUPABASE_URL=https://your-supabase-project.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=your_supabase_anon_key
+SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_key
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+### 4. Run the development server
+```bash
+npm run dev
+```
 
-## Deploy on Vercel
+Open [http://localhost:3000](http://localhost:3000) in your browser.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+---
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Verification & Build
+
+To check types and verify a production build:
+
+```bash
+npm run build
+```
+
+---
+
+## Deployment
+
+KWIP is optimized for deployment on [Vercel](https://vercel.com/). Ensure all environment variables specified in `.env.example` are configured in your Vercel project settings.
