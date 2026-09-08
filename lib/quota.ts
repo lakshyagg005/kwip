@@ -91,7 +91,7 @@ async function getUserQuotaInternal(
   }
 
   // 2. Fetch Plan & Usage from Supabase if credentials exist
-  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL) {
     try {
       const adminClient = getSupabaseAdminClient();
 
@@ -197,7 +197,7 @@ export async function reserveQuota(
     };
 
     // Update Supabase analysis_usage table if available
-    if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    if (process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL) {
       try {
         const adminClient = getSupabaseAdminClient();
         await adminClient.from('analysis_usage').upsert(
@@ -251,7 +251,7 @@ export async function refundQuota(userId: string): Promise<void> {
         updatedAt: new Date().toISOString(),
       };
 
-      if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+      if (process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL) {
         try {
           const adminClient = getSupabaseAdminClient();
           await adminClient.from('analysis_usage').upsert(
@@ -292,7 +292,7 @@ export async function setQuotaForTesting(
       updatedAt: new Date().toISOString(),
     };
 
-    if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    if (process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL) {
       try {
         const adminClient = getSupabaseAdminClient();
         await adminClient.from('analysis_usage').upsert(

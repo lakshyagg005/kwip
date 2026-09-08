@@ -397,15 +397,21 @@ function DashboardContent() {
             <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-slate-100">
               {errorInfo.code === 'USER_LIMIT_REACHED'
                 ? "You've reached your monthly free limit"
-                : errorInfo.code === 'UPSTREAM_RATE_LIMIT'
+                : errorInfo.code === 'UPSTREAM_RATE_LIMIT' || errorInfo.code === 'AI_ALL_PROVIDERS_FAILED'
                 ? 'KWIP is temporarily at capacity'
                 : errorInfo.code === 'INVALID_YOUTUBE_URL'
                 ? "That doesn't look like a valid YouTube link"
                 : errorInfo.code === 'TRANSCRIPT_UNAVAILABLE'
                 ? "We couldn't access a transcript for this video"
+                : errorInfo.code === 'TRANSCRIPT_TOO_SHORT'
+                ? 'Transcript Too Short'
                 : errorInfo.code === 'VIDEO_TOO_LONG'
                 ? 'Video Exceeds 30-Minute Limit'
-                : 'Processing Issue'}
+                : errorInfo.code === 'UNAUTHENTICATED'
+                ? 'Sign In Required'
+                : errorInfo.code === 'DATABASE_ERROR'
+                ? 'Database Processing Notice'
+                : 'Processing Notice'}
             </h3>
 
             <p className="text-xs sm:text-sm text-slate-600 dark:text-slate-300 leading-relaxed max-w-md mx-auto font-medium">

@@ -146,12 +146,31 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    const statusCode = error.statusCode || 500;
-    const errorCode = error.code || (error.message?.includes('AI_ALL_PROVIDERS_FAILED') ? 'UPSTREAM_RATE_LIMIT' : 'ANALYSIS_FAILED');
+    let statusCode = error.statusCode;
+    let errorCode = error.code;
+    let userFriendlyMessage = error.message;
 
-    const userFriendlyMessage = error.message?.includes('AI_ALL_PROVIDERS_FAILED')
-      ? 'KWIP is temporarily at capacity. Please try again in a few moments.'
-      : error.message || 'An unexpected error occurred during processing. Please try again.';
+    if (error.message?.includes('AI_ALL_PROVIDERS_FAILED')) {
+      statusCode = 503;
+      errorCode = 'AI_ALL_PROVIDERS_FAILED';
+      userFriendlyMessage = 'KWIP is temporarily at capacity. Please try again in a few moments.';
+    } else if (error.message?.includes('PGRST') || error.message?.toLowerCase().includes('database')) {
+      statusCode = 500;
+      errorCode = 'DATABASE_ERROR';
+      userFriendlyMessage = 'A database error occurred while processing your request. Please try again.';
+    }
+
+    if (!statusCode) {
+      statusCode = errorCode === 'UNAUTHENTICATED' ? 401 : errorCode === 'USER_LIMIT_REACHED' ? 403 : errorCode === 'UPSTREAM_RATE_LIMIT' ? 429 : 500;
+    }
+
+    if (!errorCode) {
+      errorCode = 'INTERNAL_SERVER_ERROR';
+    }
+
+    if (!userFriendlyMessage) {
+      userFriendlyMessage = 'An unexpected server error occurred during processing. Please try again.';
+    }
 
     return NextResponse.json(
       {
