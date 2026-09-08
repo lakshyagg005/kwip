@@ -1,6 +1,4 @@
-import fs from 'fs';
-import path from 'path';
-import { createServerSupabaseClient } from './supabase/server';
+import { createServerSupabaseClient, getSupabaseAdminClient } from './supabase/server';
 import { KwipAnalysisResult } from '@/types/kwip';
 
 export interface StoredAnalysisRecord {
@@ -10,50 +8,55 @@ export interface StoredAnalysisRecord {
   createdAt: string;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const ANALYSES_FILE = path.resolve(DATA_DIR, 'analyses-store.json');
-
-function ensureDataDir() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) {
-      fs.mkdirSync(DATA_DIR, { recursive: true });
-    }
-  } catch {
-    // Ignore read-only filesystem on Vercel
-  }
-}
+// In-memory fallback cache for serverless execution context
+const inMemoryAnalysesStore: Record<string, StoredAnalysisRecord> = {};
 
 export function readAllAnalysesStore(): Record<string, StoredAnalysisRecord> {
-  ensureDataDir();
-  try {
-    if (!fs.existsSync(ANALYSES_FILE)) {
-      return {};
-    }
-    const raw = fs.readFileSync(ANALYSES_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch (err) {
-    return {};
-  }
+  return { ...inMemoryAnalysesStore };
 }
 
 export function writeAllAnalysesStore(store: Record<string, StoredAnalysisRecord>): void {
-  ensureDataDir();
-  try {
-    fs.writeFileSync(ANALYSES_FILE, JSON.stringify(store, null, 2), 'utf8');
-  } catch (err) {
-    // Ignore read-only filesystem on Vercel
-  }
+  Object.assign(inMemoryAnalysesStore, store);
 }
 
 /**
- * Fetch all analyses belonging strictly to the authenticated user.
+ * Helper to map Supabase database row to KwipAnalysisResult object
+ */
+function mapRowToAnalysisResult(row: any): KwipAnalysisResult {
+  const content = row.content || {};
+  return {
+    id: row.id,
+    title: row.title || content.title || 'Untitled Visual Brief',
+    hook: content.hook || '',
+    executiveSummary: content.executiveSummary || '',
+    finalTakeaway: content.finalTakeaway || '',
+    keyIdeas: content.keyIdeas || [],
+    framework: content.framework,
+    statistics: content.statistics || [],
+    quotes: content.quotes || [],
+    actionSteps: content.actionSteps || [],
+    style: row.template || content.style || 'editorial',
+    selectedFormats: row.output_types || content.selectedFormats || ['brief', 'carousel', 'pdf'],
+    source: {
+      videoId: row.youtube_video_id || content.source?.videoId || '',
+      videoTitle: row.title || content.source?.videoTitle || 'YouTube Video',
+      channelTitle: content.source?.channelTitle || 'YouTube Video',
+      videoUrl: row.youtube_url || content.source?.videoUrl || '',
+      thumbnailUrl: row.thumbnail_url || content.source?.thumbnailUrl || '',
+    },
+    createdAt: row.created_at || content.createdAt || new Date().toISOString(),
+    contentType: content.contentType || 'Podcast',
+  };
+}
+
+/**
+ * Fetch all analyses belonging strictly to the authenticated user from Supabase.
  */
 export async function getUserAnalyses(userId: string): Promise<KwipAnalysisResult[]> {
   if (!userId) return [];
 
   let dbResults: KwipAnalysisResult[] = [];
 
-  // 1. Query Supabase analyses table filtering strictly by user_id
   try {
     const supabase = await createServerSupabaseClient();
     const { data, error } = await supabase
@@ -62,45 +65,47 @@ export async function getUserAnalyses(userId: string): Promise<KwipAnalysisResul
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
-    if (!error && data) {
-      dbResults = data.map((row: any) => ({
-        id: row.id,
-        title: row.title,
-        hook: row.content?.hook || '',
-        executiveSummary: row.content?.executiveSummary || '',
-        finalTakeaway: row.content?.finalTakeaway || '',
-        keyIdeas: row.content?.keyIdeas || [],
-        framework: row.content?.framework,
-        statistics: row.content?.statistics || [],
-        quotes: row.content?.quotes || [],
-        actionSteps: row.content?.actionSteps || [],
-        style: row.template || 'editorial',
-        selectedFormats: row.output_types || ['brief', 'carousel', 'pdf'],
-        source: {
-          videoId: row.youtube_video_id,
-          videoTitle: row.title,
-          channelTitle: row.content?.source?.channelTitle || 'YouTube Video',
-          videoUrl: row.youtube_url,
-          thumbnailUrl: row.thumbnail_url,
-        },
-        createdAt: row.created_at,
-        contentType: row.content?.contentType || 'Podcast',
-      }));
+    if (!error && data && Array.isArray(data)) {
+      dbResults = data.map(mapRowToAnalysisResult);
+    } else {
+      // Try admin client if server client returned no data or error
+      const adminClient = getSupabaseAdminClient();
+      const { data: adminData } = await adminClient
+        .from('analyses')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (adminData && Array.isArray(adminData)) {
+        dbResults = adminData.map(mapRowToAnalysisResult);
+      }
     }
   } catch {
-    // Ignore Supabase table missing errors
+    // Fallback to admin client or in-memory store
+    try {
+      const adminClient = getSupabaseAdminClient();
+      const { data: adminData } = await adminClient
+        .from('analyses')
+        .select('*')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (adminData && Array.isArray(adminData)) {
+        dbResults = adminData.map(mapRowToAnalysisResult);
+      }
+    } catch {
+      // Ignore
+    }
   }
 
-  // 2. Read from persistent server store strictly filtered by userId
-  const store = readAllAnalysesStore();
+  // Merge in-memory fallback items strictly for this user
   const fileResults: KwipAnalysisResult[] = [];
-  for (const item of Object.values(store)) {
+  for (const item of Object.values(inMemoryAnalysesStore)) {
     if (item.userId === userId) {
       fileResults.push(item.content);
     }
   }
 
-  // Merge and deduplicate by id
   const map = new Map<string, KwipAnalysisResult>();
   dbResults.forEach((b) => map.set(b.id, b));
   fileResults.forEach((b) => {
@@ -122,46 +127,29 @@ export async function getPublicAnalysisById(
 ): Promise<KwipAnalysisResult | null> {
   if (!analysisId) return null;
 
-  // Check persistent server store first
-  const store = readAllAnalysesStore();
-  const record = store[analysisId];
-  if (record && record.content) {
-    return record.content;
+  // Check in-memory store first
+  const cached = inMemoryAnalysesStore[analysisId];
+  if (cached && cached.content) {
+    return cached.content;
   }
 
-  // Check Supabase analyses table by id
   try {
-    const supabase = await createServerSupabaseClient();
-    const { data, error } = await supabase
+    const adminClient = getSupabaseAdminClient();
+    const { data, error } = await adminClient
       .from('analyses')
       .select('*')
       .eq('id', analysisId)
       .single();
 
     if (!error && data) {
-      return {
-        id: data.id,
-        title: data.title,
-        hook: data.content?.hook || '',
-        executiveSummary: data.content?.executiveSummary || '',
-        finalTakeaway: data.content?.finalTakeaway || '',
-        keyIdeas: data.content?.keyIdeas || [],
-        framework: data.content?.framework,
-        statistics: data.content?.statistics || [],
-        quotes: data.content?.quotes || [],
-        actionSteps: data.content?.actionSteps || [],
-        style: data.template || 'editorial',
-        selectedFormats: data.output_types || ['brief', 'carousel', 'pdf'],
-        source: {
-          videoId: data.youtube_video_id,
-          videoTitle: data.title,
-          channelTitle: data.content?.source?.channelTitle || 'YouTube Video',
-          videoUrl: data.youtube_url,
-          thumbnailUrl: data.thumbnail_url,
-        },
+      const result = mapRowToAnalysisResult(data);
+      inMemoryAnalysesStore[analysisId] = {
+        id: analysisId,
+        userId: data.user_id,
+        content: result,
         createdAt: data.created_at,
-        contentType: data.content?.contentType || 'Podcast',
       };
+      return result;
     }
   } catch {
     // Ignore
@@ -179,19 +167,15 @@ export async function getAnalysisById(
 ): Promise<KwipAnalysisResult | null> {
   if (!userId || !analysisId) return null;
 
-  // Check persistent server store first
-  const store = readAllAnalysesStore();
-  const record = store[analysisId];
-
-  if (record) {
-    // IDOR Protection: Strict ownership check!
-    if (record.userId !== userId) {
-      return null; // Access denied
+  // Check in-memory store first
+  const cached = inMemoryAnalysesStore[analysisId];
+  if (cached) {
+    if (cached.userId !== userId) {
+      return null; // IDOR Protection: Access denied
     }
-    return record.content;
+    return cached.content;
   }
 
-  // Check Supabase analyses table with user_id filter
   try {
     const supabase = await createServerSupabaseClient();
     const { data, error } = await supabase
@@ -202,39 +186,46 @@ export async function getAnalysisById(
       .single();
 
     if (!error && data) {
-      return {
-        id: data.id,
-        title: data.title,
-        hook: data.content?.hook || '',
-        executiveSummary: data.content?.executiveSummary || '',
-        finalTakeaway: data.content?.finalTakeaway || '',
-        keyIdeas: data.content?.keyIdeas || [],
-        framework: data.content?.framework,
-        statistics: data.content?.statistics || [],
-        quotes: data.content?.quotes || [],
-        actionSteps: data.content?.actionSteps || [],
-        style: data.template || 'editorial',
-        selectedFormats: data.output_types || ['brief', 'carousel', 'pdf'],
-        source: {
-          videoId: data.youtube_video_id,
-          videoTitle: data.title,
-          channelTitle: data.content?.source?.channelTitle || 'YouTube Video',
-          videoUrl: data.youtube_url,
-          thumbnailUrl: data.thumbnail_url,
-        },
+      const result = mapRowToAnalysisResult(data);
+      inMemoryAnalysesStore[analysisId] = {
+        id: analysisId,
+        userId: data.user_id,
+        content: result,
         createdAt: data.created_at,
-        contentType: data.content?.contentType || 'Podcast',
       };
+      return result;
     }
   } catch {
-    // Ignore
+    // Try admin client
+    try {
+      const adminClient = getSupabaseAdminClient();
+      const { data, error } = await adminClient
+        .from('analyses')
+        .select('*')
+        .eq('id', analysisId)
+        .eq('user_id', userId)
+        .single();
+
+      if (!error && data) {
+        const result = mapRowToAnalysisResult(data);
+        inMemoryAnalysesStore[analysisId] = {
+          id: analysisId,
+          userId: data.user_id,
+          content: result,
+          createdAt: data.created_at,
+        };
+        return result;
+      }
+    } catch {
+      // Ignore
+    }
   }
 
   return null;
 }
 
 /**
- * Save an analysis belonging to a specific user server-side.
+ * Save an analysis belonging to a specific user server-side in Supabase.
  */
 export async function saveAnalysisServer(
   userId: string,
@@ -247,37 +238,37 @@ export async function saveAnalysisServer(
   if (!userId || !analysis || !analysis.id) return;
 
   const now = new Date().toISOString();
-  const record: StoredAnalysisRecord = {
-    id: analysis.id,
-    userId,
-    content: {
-      ...analysis,
-      createdAt: analysis.createdAt || now,
-    },
-    createdAt: analysis.createdAt || now,
+  const createdAt = analysis.createdAt || now;
+  const analysisRecord: KwipAnalysisResult = {
+    ...analysis,
+    createdAt,
   };
 
-  const store = readAllAnalysesStore();
-  store[analysis.id] = record;
-  writeAllAnalysesStore(store);
+  // Sync to in-memory store
+  inMemoryAnalysesStore[analysis.id] = {
+    id: analysis.id,
+    userId,
+    content: analysisRecord,
+    createdAt,
+  };
 
-  // Sync to Supabase analyses table with user_id = userId
+  // Persist to Supabase analyses table with user_id = userId
   try {
-    const supabase = await createServerSupabaseClient();
-    await supabase.from('analyses').upsert({
+    const adminClient = getSupabaseAdminClient();
+    await adminClient.from('analyses').upsert({
       id: analysis.id,
       user_id: userId,
       youtube_url: youtubeUrl,
       youtube_video_id: videoId,
-      title: analysis.title,
-      thumbnail_url: analysis.source?.thumbnailUrl,
-      content: analysis,
+      title: analysis.title || 'Untitled Visual Brief',
+      thumbnail_url: analysis.source?.thumbnailUrl || '',
+      content: analysisRecord,
       output_types: formats,
       template: style,
-      created_at: record.createdAt,
+      created_at: createdAt,
     });
-  } catch {
-    // Ignore
+  } catch (err: any) {
+    console.error('[SaveAnalysisServer Supabase Error]:', err.message || err);
   }
 }
 
@@ -290,26 +281,23 @@ export async function deleteAnalysisServer(
 ): Promise<boolean> {
   if (!userId || !analysisId) return false;
 
-  const store = readAllAnalysesStore();
-  const record = store[analysisId];
-
-  if (record) {
-    if (record.userId !== userId) {
+  const cached = inMemoryAnalysesStore[analysisId];
+  if (cached) {
+    if (cached.userId !== userId) {
       return false; // Cannot delete another user's content!
     }
-    delete store[analysisId];
-    writeAllAnalysesStore(store);
+    delete inMemoryAnalysesStore[analysisId];
   }
 
   try {
-    const supabase = await createServerSupabaseClient();
-    await supabase
+    const adminClient = getSupabaseAdminClient();
+    await adminClient
       .from('analyses')
       .delete()
       .eq('id', analysisId)
       .eq('user_id', userId);
-  } catch {
-    // Ignore
+  } catch (err: any) {
+    console.error('[DeleteAnalysisServer Supabase Error]:', err.message || err);
   }
 
   return true;

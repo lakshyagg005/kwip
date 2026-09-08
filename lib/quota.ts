@@ -1,6 +1,4 @@
-import fs from 'fs';
-import path from 'path';
-import { createServerSupabaseClient } from './supabase/server';
+import { getSupabaseAdminClient } from './supabase/server';
 
 export interface UserQuotaRecord {
   userId: string;
@@ -23,8 +21,8 @@ export interface QuotaStatus {
   error?: string;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const QUOTA_FILE = path.resolve(DATA_DIR, 'quota-store.json');
+// In-memory fallback cache for serverless execution context
+const inMemoryQuotaStore: Record<string, UserQuotaRecord> = {};
 
 // In-memory concurrency locks per userId to ensure atomic operations
 const userLocks = new Map<string, Promise<any>>();
@@ -53,105 +51,112 @@ function acquireLock<T>(userId: string, fn: () => Promise<T>): Promise<T> {
   });
 }
 
-function ensureDataDir() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-}
-
 export function readAllQuotas(): Record<string, UserQuotaRecord> {
-  ensureDataDir();
-  if (!fs.existsSync(QUOTA_FILE)) {
-    return {};
-  }
-  try {
-    const raw = fs.readFileSync(QUOTA_FILE, 'utf8');
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error('[QuotaStore] Error reading quota-store.json:', err);
-    return {};
-  }
+  return { ...inMemoryQuotaStore };
 }
 
 export function writeAllQuotas(store: Record<string, UserQuotaRecord>): void {
-  ensureDataDir();
-  try {
-    fs.writeFileSync(QUOTA_FILE, JSON.stringify(store, null, 2), 'utf8');
-  } catch (err) {
-    console.error('[QuotaStore] Error writing quota-store.json:', err);
-  }
+  Object.assign(inMemoryQuotaStore, store);
 }
 
-function computeNextResetDate(startDate: Date): Date {
-  const next = new Date(startDate);
-  next.setMonth(next.getMonth() + 1);
-  return next;
+function getMonthlyPeriodBounds(d = new Date()) {
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth();
+  const periodStart = new Date(Date.UTC(year, month, 1)).toISOString();
+  const nextResetAt = new Date(Date.UTC(year, month + 1, 1)).toISOString();
+  const monthKey = periodStart.slice(0, 7); // 'YYYY-MM'
+  return { monthKey, periodStart, nextResetAt };
 }
 
-function getOrUpdateQuotaRecordInternal(
-  store: Record<string, UserQuotaRecord>,
+async function getUserQuotaInternal(
   userId: string,
-  plan: 'free' | 'pro'
-): UserQuotaRecord {
-  const now = new Date();
-  let record = store[userId];
+  planHint: 'free' | 'pro' = 'free'
+): Promise<QuotaStatus> {
+  const { monthKey, periodStart, nextResetAt } = getMonthlyPeriodBounds();
+  let usageCount = 0;
+  let effectivePlan: 'free' | 'pro' = planHint;
 
-  if (!record) {
-    const periodStart = now.toISOString();
-    const nextResetAt = computeNextResetDate(now).toISOString();
-    record = {
-      userId,
-      plan,
-      analysisCount: 0,
-      periodStart,
-      nextResetAt,
-      updatedAt: now.toISOString(),
-    };
-    store[userId] = record;
-  } else {
-    // Check if current monthly period has expired
-    const resetDate = new Date(record.nextResetAt);
-    if (now >= resetDate) {
-      // Reset usage exactly once for the new monthly period
-      record.analysisCount = 0;
-      record.periodStart = now.toISOString();
-      record.nextResetAt = computeNextResetDate(now).toISOString();
-      record.updatedAt = now.toISOString();
+  // 1. Check in-memory store first
+  const cached = inMemoryQuotaStore[userId];
+  if (cached) {
+    if (cached.periodStart.slice(0, 7) !== monthKey) {
+      // Period reset
+      cached.analysisCount = 0;
+      cached.periodStart = periodStart;
+      cached.nextResetAt = nextResetAt;
     }
-    // Sync plan if updated
-    record.plan = plan;
+    cached.plan = planHint !== 'free' ? planHint : cached.plan;
+    usageCount = cached.analysisCount;
+    effectivePlan = cached.plan;
   }
 
-  return record;
+  // 2. Fetch Plan & Usage from Supabase if credentials exist
+  if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    try {
+      const adminClient = getSupabaseAdminClient();
+
+      if (planHint === 'free') {
+        const { data: profile } = await adminClient
+          .from('profiles')
+          .select('plan')
+          .eq('id', userId)
+          .single();
+        if (profile?.plan === 'pro' || profile?.plan === 'free') {
+          effectivePlan = profile.plan;
+        }
+      }
+
+      const { data: usageRow } = await adminClient
+        .from('analysis_usage')
+        .select('analysis_count')
+        .eq('user_id', userId)
+        .eq('month_key', monthKey)
+        .single();
+
+      if (usageRow && typeof usageRow.analysis_count === 'number') {
+        const dbCount = usageRow.analysis_count;
+        const cachedCount = (cached && cached.periodStart === periodStart) ? cached.analysisCount : 0;
+        usageCount = Math.max(dbCount, cachedCount);
+      }
+    } catch {
+      // Use cached/default values
+    }
+  }
+
+  // Sync in-memory store state
+  inMemoryQuotaStore[userId] = {
+    userId,
+    plan: effectivePlan,
+    analysisCount: usageCount,
+    periodStart,
+    nextResetAt,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const isPro = effectivePlan === 'pro';
+  const limit = isPro ? 999999 : 2;
+  const remaining = isPro ? 999999 : Math.max(0, limit - usageCount);
+
+  return {
+    success: true,
+    userId,
+    plan: effectivePlan,
+    usageCount,
+    limit,
+    remaining,
+    periodStart,
+    nextResetAt,
+  };
 }
 
 /**
- * Get current authoritative quota status for a user
+ * Get current authoritative quota status for a user from Supabase
  */
 export async function getUserQuota(
   userId: string,
-  plan: 'free' | 'pro' = 'free'
+  planHint: 'free' | 'pro' = 'free'
 ): Promise<QuotaStatus> {
-  return acquireLock(userId, async () => {
-    const store = readAllQuotas();
-    const record = getOrUpdateQuotaRecordInternal(store, userId, plan);
-    writeAllQuotas(store);
-
-    const isPro = record.plan === 'pro';
-    const limit = isPro ? 999999 : 2;
-    const remaining = isPro ? 999999 : Math.max(0, limit - record.analysisCount);
-
-    return {
-      success: true,
-      userId,
-      plan: record.plan,
-      usageCount: record.analysisCount,
-      limit,
-      remaining,
-      periodStart: record.periodStart,
-      nextResetAt: record.nextResetAt,
-    };
-  });
+  return acquireLock(userId, () => getUserQuotaInternal(userId, planHint));
 }
 
 /**
@@ -159,62 +164,69 @@ export async function getUserQuota(
  */
 export async function reserveQuota(
   userId: string,
-  plan: 'free' | 'pro' = 'free'
+  planHint: 'free' | 'pro' = 'free'
 ): Promise<QuotaStatus> {
   return acquireLock(userId, async () => {
-    const store = readAllQuotas();
-    const record = getOrUpdateQuotaRecordInternal(store, userId, plan);
+    const status = await getUserQuotaInternal(userId, planHint);
+    const { monthKey, periodStart, nextResetAt } = getMonthlyPeriodBounds();
 
-    if (record.plan === 'free') {
-      if (record.analysisCount >= 2) {
-        writeAllQuotas(store);
-        return {
-          success: false,
-          userId,
-          plan: record.plan,
-          usageCount: record.analysisCount,
-          limit: 2,
-          remaining: 0,
-          periodStart: record.periodStart,
-          nextResetAt: record.nextResetAt,
-          error: "You've used both free analyses for this month. Upgrade to KWIP Pro for unlimited analyses.",
-        };
+    if (status.plan === 'free' && status.usageCount >= 2) {
+      return {
+        success: false,
+        userId,
+        plan: status.plan,
+        usageCount: status.usageCount,
+        limit: 2,
+        remaining: 0,
+        periodStart,
+        nextResetAt,
+        error: "You've used both free analyses for this month. Upgrade to KWIP Pro for unlimited analyses.",
+      };
+    }
+
+    const newCount = status.usageCount + 1;
+
+    // Sync in-memory store immediately
+    inMemoryQuotaStore[userId] = {
+      userId,
+      plan: status.plan,
+      analysisCount: newCount,
+      periodStart,
+      nextResetAt,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // Update Supabase analysis_usage table if available
+    if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+      try {
+        const adminClient = getSupabaseAdminClient();
+        await adminClient.from('analysis_usage').upsert(
+          {
+            user_id: userId,
+            month_key: monthKey,
+            analysis_count: newCount,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id,month_key' }
+        );
+      } catch {
+        // Ignore remote DB error
       }
-
-      // Atomically increment quota usage
-      record.analysisCount += 1;
-      record.updatedAt = new Date().toISOString();
     }
 
-    writeAllQuotas(store);
-
-    // Attempt dual-write sync with Supabase analysis_usage table if available
-    try {
-      const supabase = await createServerSupabaseClient();
-      const monthKey = new Date().toISOString().slice(0, 7);
-      await supabase.from('analysis_usage').upsert({
-        user_id: userId,
-        month_key: monthKey,
-        analysis_count: record.analysisCount,
-        updated_at: new Date().toISOString(),
-      });
-    } catch {
-      // Ignore remote database missing table errors
-    }
-
-    const isPro = record.plan === 'pro';
+    const isPro = status.plan === 'pro';
     const limit = isPro ? 999999 : 2;
-    const remaining = isPro ? 999999 : Math.max(0, limit - record.analysisCount);
+    const remaining = isPro ? 999999 : Math.max(0, limit - newCount);
 
     return {
       success: true,
       userId,
-      plan: record.plan,
-      usageCount: record.analysisCount,
+      plan: status.plan,
+      usageCount: newCount,
       limit,
       remaining,
-      periodStart: record.periodStart,
-      nextResetAt: record.nextResetAt,
+      periodStart,
+      nextResetAt,
     };
   });
 }
@@ -224,24 +236,36 @@ export async function reserveQuota(
  */
 export async function refundQuota(userId: string): Promise<void> {
   return acquireLock(userId, async () => {
-    const store = readAllQuotas();
-    const record = store[userId];
-    if (record && record.plan === 'free' && record.analysisCount > 0) {
-      record.analysisCount -= 1;
-      record.updatedAt = new Date().toISOString();
-      writeAllQuotas(store);
+    const { monthKey, periodStart, nextResetAt } = getMonthlyPeriodBounds();
+    const status = await getUserQuotaInternal(userId);
 
-      try {
-        const supabase = await createServerSupabaseClient();
-        const monthKey = new Date().toISOString().slice(0, 7);
-        await supabase.from('analysis_usage').upsert({
-          user_id: userId,
-          month_key: monthKey,
-          analysis_count: record.analysisCount,
-          updated_at: new Date().toISOString(),
-        });
-      } catch {
-        // Ignore
+    if (status.plan === 'free' && status.usageCount > 0) {
+      const newCount = status.usageCount - 1;
+
+      inMemoryQuotaStore[userId] = {
+        userId,
+        plan: status.plan,
+        analysisCount: newCount,
+        periodStart,
+        nextResetAt,
+        updatedAt: new Date().toISOString(),
+      };
+
+      if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+        try {
+          const adminClient = getSupabaseAdminClient();
+          await adminClient.from('analysis_usage').upsert(
+            {
+              user_id: userId,
+              month_key: monthKey,
+              analysis_count: newCount,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id,month_key' }
+          );
+        } catch {
+          // Ignore
+        }
       }
     }
   });
@@ -258,8 +282,8 @@ export async function setQuotaForTesting(
   plan: 'free' | 'pro' = 'free'
 ): Promise<void> {
   return acquireLock(userId, async () => {
-    const store = readAllQuotas();
-    store[userId] = {
+    const monthKey = periodStart.slice(0, 7);
+    inMemoryQuotaStore[userId] = {
       userId,
       plan,
       analysisCount,
@@ -267,6 +291,22 @@ export async function setQuotaForTesting(
       nextResetAt,
       updatedAt: new Date().toISOString(),
     };
-    writeAllQuotas(store);
+
+    if (process.env.NEXT_PUBLIC_SUPABASE_URL) {
+      try {
+        const adminClient = getSupabaseAdminClient();
+        await adminClient.from('analysis_usage').upsert(
+          {
+            user_id: userId,
+            month_key: monthKey,
+            analysis_count: analysisCount,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'user_id,month_key' }
+        );
+      } catch {
+        // Ignore
+      }
+    }
   });
 }
