@@ -93,21 +93,20 @@ async function fetchVideoMetadata(videoId) {
   return defaultMeta;
 }
 
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', time: new Date().toISOString() });
-});
-
-app.post('/api/transcript', async (req, res) => {
+const handleTranscriptRequest = async (req, res) => {
   if (WORKER_SECRET) {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.startsWith('Bearer ') ? authHeader.substring(7) : '';
     if (token !== WORKER_SECRET) {
+      console.warn('[Worker Auth Warning] Secret mismatch or missing Bearer token');
       return res.status(401).json({ success: false, error: 'Unauthorized worker secret' });
     }
   }
 
   const { videoId: reqVideoId, url } = req.body || {};
   const videoId = reqVideoId || extractVideoId(url);
+
+  console.log(`[Worker Incoming Request] videoId=${videoId || 'NULL'}, url=${url || 'NULL'}`);
 
   if (!videoId) {
     return res.status(400).json({ success: false, error: 'Invalid or missing YouTube videoId/URL' });
@@ -145,6 +144,7 @@ app.post('/api/transcript', async (req, res) => {
             const textLines = parseTranscriptXml(xmlText);
             if (textLines.length > 0) {
               const rawTranscript = textLines.join(' ');
+              console.log(`[Worker Success] videoId=${videoId}, length=${rawTranscript.length} chars (Strategy: InnerTube)`);
               return res.json({
                 success: true,
                 rawTranscript,
@@ -160,6 +160,7 @@ app.post('/api/transcript', async (req, res) => {
     const pkgItems = await YoutubeTranscript.fetchTranscript(videoId).catch(() => null);
     if (pkgItems && Array.isArray(pkgItems) && pkgItems.length > 0) {
       const rawTranscript = pkgItems.map(i => i.text).join(' ');
+      console.log(`[Worker Success] videoId=${videoId}, length=${rawTranscript.length} chars (Strategy: youtube-transcript)`);
       return res.json({
         success: true,
         rawTranscript,
@@ -167,12 +168,20 @@ app.post('/api/transcript', async (req, res) => {
       });
     }
 
+    console.warn(`[Worker Failed] No transcript tracks found for videoId=${videoId}`);
     return res.status(422).json({ success: false, error: 'No transcript found for video' });
   } catch (err) {
     console.error('[Worker Error]:', err);
     return res.status(500).json({ success: false, error: err.message || 'Worker processing error' });
   }
+};
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', time: new Date().toISOString() });
 });
+
+app.post('/api/transcript', handleTranscriptRequest);
+app.post('/transcript', handleTranscriptRequest);
 
 app.listen(PORT, () => {
   console.log(`🚀 KWIP Transcript Worker listening on port ${PORT}`);

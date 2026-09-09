@@ -425,6 +425,22 @@ async function fetchCaptionTracksWatchPage(videoId: string): Promise<{ tracks: C
   }
 }
 
+export function normalizeWorkerUrl(baseUrl: string): string {
+  if (!baseUrl || typeof baseUrl !== 'string') return '';
+  let cleaned = baseUrl.trim().replace(/\/+$/, '');
+  if (!cleaned) return '';
+  if (cleaned.endsWith('/api/transcript')) {
+    return cleaned;
+  }
+  if (cleaned.endsWith('/transcript')) {
+    return cleaned;
+  }
+  if (cleaned.endsWith('/api')) {
+    return `${cleaned}/transcript`;
+  }
+  return `${cleaned}/api/transcript`;
+}
+
 export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchResult> {
   const videoId = extractYoutubeVideoId(url);
   if (!videoId) {
@@ -433,13 +449,19 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
 
   console.log(`[YouTube Transcript] Request started for videoId=${videoId}`);
 
-  // Pluggable External Worker Option (e.g. Railway/Render worker for non-datacenter IP execution)
-  const workerUrl = process.env.TRANSCRIPT_WORKER_URL;
-  if (workerUrl && workerUrl.trim().length > 0) {
+  const rawWorkerUrl = process.env.TRANSCRIPT_WORKER_URL;
+  const isWorkerConfigured = Boolean(rawWorkerUrl && rawWorkerUrl.trim().length > 0);
+
+  console.log(`[Transcript Worker] configured: ${isWorkerConfigured}`);
+
+  if (isWorkerConfigured && rawWorkerUrl) {
+    const targetUrl = normalizeWorkerUrl(rawWorkerUrl);
+    console.log(`[Transcript Worker] attempting request to targetUrl=${targetUrl}`);
+
+    const workerSecret = process.env.TRANSCRIPT_WORKER_SECRET || '';
+
     try {
-      console.log(`[YouTube Worker] Routing transcript request for videoId=${videoId} to worker: ${workerUrl.trim()}`);
-      const workerSecret = process.env.TRANSCRIPT_WORKER_SECRET || '';
-      const workerRes = await fetch(`${workerUrl.trim().replace(/\/$/, '')}/api/transcript`, {
+      const workerRes = await fetch(targetUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -448,10 +470,12 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
         body: JSON.stringify({ videoId, url }),
       });
 
+      console.log(`[Transcript Worker] response status: ${workerRes.status}`);
+
       if (workerRes.ok) {
         const workerData = await workerRes.json();
         if (workerData?.success && workerData?.rawTranscript) {
-          console.log(`[YouTube Worker Success] videoId=${videoId}, transcriptLength=${workerData.rawTranscript.length} chars`);
+          console.log(`[Transcript Worker] success: videoId=${videoId}, transcriptLength=${workerData.rawTranscript.length} chars`);
           return {
             videoId,
             metadata: workerData.metadata || {
@@ -465,12 +489,52 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
             transcriptLength: workerData.rawTranscript.length,
           };
         }
-      } else {
-        console.warn(`[YouTube Worker Warning] Worker returned status=${workerRes.status} for videoId=${videoId}. Falling back to direct extraction.`);
+
+        console.error(`[Transcript Worker] failure: Worker returned HTTP 200 but invalid payload structure.`);
+        throw new YoutubeExtractionError(
+          'Transcript worker returned invalid response structure.',
+          'WORKER_INVALID_PAYLOAD',
+          502
+        );
       }
+
+      let errorDetail = '';
+      try {
+        const errJson = await workerRes.json();
+        errorDetail = errJson?.error || JSON.stringify(errJson);
+      } catch {
+        errorDetail = await workerRes.text().catch(() => '');
+      }
+
+      console.error(`[Transcript Worker] failure: HTTP ${workerRes.status} - ${errorDetail || 'Worker returned error'}`);
+
+      throw new YoutubeExtractionError(
+        `Transcript worker failed (HTTP ${workerRes.status}): ${errorDetail || 'Worker returned error status'}`,
+        'WORKER_EXTRACTION_FAILED',
+        workerRes.status === 401 ? 401 : workerRes.status === 422 ? 422 : 503
+      );
     } catch (workerErr: any) {
-      console.warn(`[YouTube Worker Warning] Exception connecting to worker for videoId=${videoId}: ${workerErr?.message || workerErr}. Falling back to direct extraction.`);
+      if (workerErr instanceof YoutubeExtractionError) {
+        throw workerErr;
+      }
+      console.error(`[Transcript Worker] failure: Connection error to ${targetUrl}: ${workerErr?.message || workerErr}`);
+      throw new YoutubeExtractionError(
+        `Failed to reach transcript worker at ${targetUrl}: ${workerErr?.message || 'Connection failed'}`,
+        'WORKER_CONNECTION_FAILED',
+        503
+      );
     }
+  }
+
+  // If worker is NOT configured in serverless production mode:
+  const isServerlessProd = process.env.VERCEL === '1' || process.env.NODE_ENV === 'production';
+  if (isServerlessProd) {
+    console.error(`[Transcript Worker] failure: TRANSCRIPT_WORKER_URL is missing at runtime in serverless production environment.`);
+    throw new YoutubeExtractionError(
+      'TRANSCRIPT_WORKER_URL environment variable is missing at runtime on Vercel. Please configure TRANSCRIPT_WORKER_URL in Vercel project settings and redeploy.',
+      'WORKER_NOT_CONFIGURED',
+      503
+    );
   }
 
   let isVerifiedPublic = false;
