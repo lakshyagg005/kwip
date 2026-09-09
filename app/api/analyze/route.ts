@@ -100,17 +100,12 @@ export async function POST(req: NextRequest) {
       try {
         youtubeData = await fetchYoutubeTranscript(url);
       } catch (transcriptError: any) {
-        const isMissingTranscript = transcriptError.message?.includes('TRANSCRIPT_UNAVAILABLE');
-        const isTooLong = transcriptError.message?.includes('VIDEO_TOO_LONG');
-        const userMsg = isTooLong
-          ? 'KWIP currently supports videos up to 30 minutes.'
-          : isMissingTranscript
-          ? "We couldn't access a transcript for this video. KWIP currently needs an available YouTube transcript or captions to understand the video."
-          : transcriptError.message || 'Failed to retrieve YouTube transcript.';
-
-        const err = new Error(userMsg);
-        (err as any).code = isTooLong ? 'VIDEO_TOO_LONG' : isMissingTranscript ? 'TRANSCRIPT_UNAVAILABLE' : 'TRANSCRIPT_ERROR';
-        (err as any).statusCode = isTooLong ? 400 : 422;
+        console.error(
+          `[Analyze API Transcript Error] videoId=${videoId}, code=${transcriptError.code || 'TRANSCRIPT_ERROR'}, statusCode=${transcriptError.statusCode || 422}, message="${transcriptError.message}"`
+        );
+        const err = new Error(transcriptError.message || 'Failed to retrieve YouTube transcript.');
+        (err as any).code = transcriptError.code || 'TRANSCRIPT_ERROR';
+        (err as any).statusCode = transcriptError.statusCode || 422;
         throw err;
       }
 
