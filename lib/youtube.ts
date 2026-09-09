@@ -89,7 +89,16 @@ export async function fetchYoutubeVideoDetails(url: string): Promise<SourceMetad
 
   try {
     const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;
-    const res = await fetch(oembedUrl, { next: { revalidate: 3600 } });
+    let res = await fetch(oembedUrl, { next: { revalidate: 3600 } });
+
+    if (!res.ok) {
+      const shortsOembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/shorts/${videoId}`)}&format=json`;
+      const shortsRes = await fetch(shortsOembedUrl, { next: { revalidate: 3600 } });
+      if (shortsRes.ok) {
+        res = shortsRes;
+      }
+    }
+
     if (res.ok) {
       const data = await res.json();
       return {
