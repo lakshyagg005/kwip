@@ -1,0 +1,13 @@
+{
+  "name": "kwip-transcript-worker",
+  "version": "1.0.0",
+  "description": "Standalone YouTube transcript extraction microservice for KWIP production deployment",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "youtube-transcript": "^1.3.1"
+  }
+}

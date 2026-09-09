@@ -145,7 +145,11 @@ export async function POST(req: NextRequest) {
     let errorCode = error.code;
     let userFriendlyMessage = error.message;
 
-    if (error.message?.includes('AI_ALL_PROVIDERS_FAILED')) {
+    if (error.code === 'YOUTUBE_IP_BLOCKED') {
+      statusCode = 503;
+      errorCode = 'YOUTUBE_IP_BLOCKED';
+      userFriendlyMessage = 'YouTube temporarily restricted serverless access for this request. Please try again in a few moments.';
+    } else if (error.message?.includes('AI_ALL_PROVIDERS_FAILED')) {
       statusCode = 503;
       errorCode = 'AI_ALL_PROVIDERS_FAILED';
       userFriendlyMessage = 'KWIP is temporarily at capacity. Please try again in a few moments.';
@@ -156,7 +160,7 @@ export async function POST(req: NextRequest) {
     }
 
     if (!statusCode) {
-      statusCode = errorCode === 'UNAUTHENTICATED' ? 401 : errorCode === 'USER_LIMIT_REACHED' ? 403 : errorCode === 'UPSTREAM_RATE_LIMIT' ? 429 : 500;
+      statusCode = errorCode === 'UNAUTHENTICATED' ? 401 : errorCode === 'USER_LIMIT_REACHED' ? 403 : errorCode === 'UPSTREAM_RATE_LIMIT' || errorCode === 'YOUTUBE_RATE_LIMITED' ? 429 : 500;
     }
 
     if (!errorCode) {
