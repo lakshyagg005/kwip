@@ -99,7 +99,11 @@ export async function fetchYoutubeVideoDetails(url: string): Promise<SourceMetad
         thumbnailUrl: data.thumbnail_url || defaultMeta.thumbnailUrl,
       };
     }
+    if (res.status === 404 || res.status === 401) {
+      throw new YoutubeExtractionError('This YouTube video is unavailable, private, or age-restricted.', 'YOUTUBE_VIDEO_UNAVAILABLE', 404);
+    }
   } catch (err) {
+    if (err instanceof YoutubeExtractionError) throw err;
     console.warn('[YouTube OEMBED Warning]:', err);
   }
 
@@ -275,27 +279,10 @@ interface CaptionTrackInfo {
   name?: string;
 }
 
-function selectBestCaptionTrack(tracks: CaptionTrackInfo[]): CaptionTrackInfo | null {
-  if (!tracks || tracks.length === 0) return null;
 
-  // 1. Manual English track (kind !== 'asr', lang starts with 'en')
-  const manualEnglish = tracks.find(t => t.kind !== 'asr' && t.languageCode?.toLowerCase().startsWith('en'));
-  if (manualEnglish) return manualEnglish;
 
-  // 2. Auto-generated English track (kind === 'asr', lang starts with 'en' or vssId includes 'en')
-  const autoEnglish = tracks.find(t => t.languageCode?.toLowerCase().startsWith('en') || t.vssId?.toLowerCase().includes('en'));
-  if (autoEnglish) return autoEnglish;
-
-  // 3. Manual track in any language
-  const manualAny = tracks.find(t => t.kind !== 'asr');
-  if (manualAny) return manualAny;
-
-  // 4. Any track
-  return tracks[0] || null;
-}
-
-// Strategy 1: InnerTube API
-async function fetchCaptionTracksInnerTube(videoId: string, clientName: string = 'ANDROID', clientVersion: string = '20.10.38'): Promise<{ tracks: CaptionTrackInfo[]; playabilityStatus?: string }> {
+// Strategy 1: InnerTube API Context (Most reliable for signed caption URLs)
+async function fetchCaptionTracksInnerTube(videoId: string, clientName: string = 'ANDROID', clientVersion: string = '20.10.38'): Promise<{ tracks: CaptionTrackInfo[]; isPrivateOrBlocked?: boolean }> {
   const uaMap: Record<string, string> = {
     ANDROID: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)',
     TVHTML5: 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
@@ -334,28 +321,28 @@ async function fetchCaptionTracksInnerTube(videoId: string, clientName: string =
   const data = await response.json();
   const playabilityStatus = data?.playabilityStatus?.status;
 
-  if (playabilityStatus === 'UNPLAYABLE' || playabilityStatus === 'ERROR' || playabilityStatus === 'LOGIN_REQUIRED') {
-    return { tracks: [], playabilityStatus };
+  if (playabilityStatus === 'ERROR' || playabilityStatus === 'LOGIN_REQUIRED') {
+    return { tracks: [], isPrivateOrBlocked: true };
   }
 
   const captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
   if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
-    return { tracks: [], playabilityStatus };
+    return { tracks: [] };
   }
 
   const tracks: CaptionTrackInfo[] = captionTracks.map((t: any) => ({
-    baseUrl: t.baseUrl,
+    baseUrl: t.baseUrl ? t.baseUrl.replace(/\\u0026/g, '&').replace(/&amp;/g, '&') : '',
     languageCode: t.languageCode || 'en',
     kind: t.kind,
     vssId: t.vssId,
     name: t.name?.runs?.[0]?.text || t.name?.simpleText,
-  }));
+  })).filter(t => Boolean(t.baseUrl));
 
-  return { tracks, playabilityStatus };
+  return { tracks };
 }
 
-// Strategy 2: Direct Watch Page Scraping with Anti-Consent Headers
-async function fetchCaptionTracksWatchPage(videoId: string): Promise<{ tracks: CaptionTrackInfo[]; playabilityStatus?: string }> {
+// Strategy 2: Direct Watch Page Scraping with Anti-Consent Headers (Fallback)
+async function fetchCaptionTracksWatchPage(videoId: string): Promise<{ tracks: CaptionTrackInfo[]; isPrivateOrBlocked?: boolean }> {
   const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
     headers: {
       'User-Agent':
@@ -366,6 +353,9 @@ async function fetchCaptionTracksWatchPage(videoId: string): Promise<{ tracks: C
   });
 
   if (!response.ok) {
+    if (response.status === 404 || response.status === 401) {
+      return { tracks: [], isPrivateOrBlocked: true };
+    }
     return { tracks: [] };
   }
 
@@ -375,29 +365,32 @@ async function fetchCaptionTracksWatchPage(videoId: string): Promise<{ tracks: C
     throw new YoutubeExtractionError('YouTube requested CAPTCHA verification.', 'YOUTUBE_RATE_LIMITED', 429);
   }
 
-  const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/);
-  if (!captionTracksMatch) {
-    return { tracks: [] };
+  if (html.includes('This video is private') || html.includes('This video has been removed')) {
+    return { tracks: [], isPrivateOrBlocked: true };
   }
 
-  try {
-    const captionTracks = JSON.parse(captionTracksMatch[1]);
-    if (!Array.isArray(captionTracks) || captionTracks.length === 0) {
-      return { tracks: [] };
+  // Regex Matchers
+  const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/) || html.match(/\\"captionTracks\\":\s*(\[.*?\])/);
+  if (captionTracksMatch) {
+    try {
+      const unescaped = captionTracksMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+      const captionTracks = JSON.parse(unescaped);
+      if (Array.isArray(captionTracks) && captionTracks.length > 0) {
+        const tracks: CaptionTrackInfo[] = captionTracks.map((t: any) => ({
+          baseUrl: t.baseUrl ? t.baseUrl.replace(/\\u0026/g, '&').replace(/&amp;/g, '&') : '',
+          languageCode: t.languageCode || 'en',
+          kind: t.kind,
+          vssId: t.vssId,
+          name: t.name?.runs?.[0]?.text || t.name?.simpleText,
+        })).filter(t => Boolean(t.baseUrl));
+        return { tracks };
+      }
+    } catch {
+      // Continue to next fallback
     }
-
-    const tracks: CaptionTrackInfo[] = captionTracks.map((t: any) => ({
-      baseUrl: t.baseUrl,
-      languageCode: t.languageCode || 'en',
-      kind: t.kind,
-      vssId: t.vssId,
-      name: t.name?.runs?.[0]?.text || t.name?.simpleText,
-    }));
-
-    return { tracks };
-  } catch {
-    return { tracks: [] };
   }
+
+  return { tracks: [] };
 }
 
 export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchResult> {
@@ -408,7 +401,26 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
 
   console.log(`[YouTube Transcript] Request started for videoId=${videoId}`);
 
-  const metadata = await fetchYoutubeVideoDetails(url);
+  let isVerifiedPublic = false;
+  let metadata: SourceMetadata;
+
+  try {
+    metadata = await fetchYoutubeVideoDetails(url);
+    if (metadata && metadata.videoTitle && !metadata.videoTitle.includes('YouTube Video (')) {
+      isVerifiedPublic = true;
+    }
+  } catch (err: any) {
+    if (err instanceof YoutubeExtractionError) {
+      throw err;
+    }
+    metadata = {
+      videoId,
+      videoTitle: `YouTube Video (${videoId})`,
+      channelTitle: 'YouTube Content',
+      videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+      thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    };
+  }
 
   // 0. Pre-check Video Duration before transcript fetching
   try {
@@ -429,13 +441,15 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
 
   let tracks: CaptionTrackInfo[] = [];
   let extractionMethod = '';
-  let playabilityStatus: string | undefined;
+  let isPrivateOrBlocked = false;
 
-  // Strategy 1: InnerTube ANDROID Client Context
+  // Strategy 1: InnerTube ANDROID Client Context (Primary: signed caption URLs)
   try {
     const res1 = await fetchCaptionTracksInnerTube(videoId, 'ANDROID', '20.10.38');
     tracks = res1.tracks;
-    playabilityStatus = res1.playabilityStatus;
+    if (res1.isPrivateOrBlocked) {
+      isPrivateOrBlocked = true;
+    }
     if (tracks.length > 0) {
       extractionMethod = 'InnerTube (ANDROID)';
     }
@@ -444,7 +458,7 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
   }
 
   // Strategy 2: InnerTube TVHTML5 Client Context (Fallback)
-  if (tracks.length === 0) {
+  if (tracks.length === 0 && !isPrivateOrBlocked) {
     try {
       const res2 = await fetchCaptionTracksInnerTube(videoId, 'TVHTML5', '7.20230405.08.00');
       tracks = res2.tracks;
@@ -456,11 +470,14 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
     }
   }
 
-  // Strategy 3: Watch Page HTML Scraping (Fallback)
-  if (tracks.length === 0) {
+  // Strategy 3: Watch Page HTML Scraping with Anti-Consent Headers (Fallback)
+  if (tracks.length === 0 && !isPrivateOrBlocked) {
     try {
       const res3 = await fetchCaptionTracksWatchPage(videoId);
       tracks = res3.tracks;
+      if (res3.isPrivateOrBlocked) {
+        isPrivateOrBlocked = true;
+      }
       if (tracks.length > 0) {
         extractionMethod = 'Watch Page HTML';
       }
@@ -471,7 +488,7 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
 
   // Strategy 4: npm package youtube-transcript (Fallback)
   let packageItems: TranscriptItem[] = [];
-  if (tracks.length === 0) {
+  if (tracks.length === 0 && !isPrivateOrBlocked) {
     try {
       const pkgResult = await YoutubeTranscript.fetchTranscript(videoId).catch(() => null);
       if (pkgResult && Array.isArray(pkgResult) && pkgResult.length > 0) {
@@ -488,14 +505,16 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
   }
 
   if (tracks.length === 0 && packageItems.length === 0) {
-    console.error(`[YouTube Transcript] Failed to find transcript tracks for videoId=${videoId}, playability=${playabilityStatus}`);
-    if (playabilityStatus === 'UNPLAYABLE' || playabilityStatus === 'ERROR' || playabilityStatus === 'LOGIN_REQUIRED') {
+    console.error(`[YouTube Transcript] Failed to find transcript tracks for videoId=${videoId}, isVerifiedPublic=${isVerifiedPublic}, isPrivateOrBlocked=${isPrivateOrBlocked}`);
+    
+    if (isPrivateOrBlocked && !isVerifiedPublic) {
       throw new YoutubeExtractionError(
         'This YouTube video is unavailable, private, or age-restricted.',
         'YOUTUBE_VIDEO_UNAVAILABLE',
         404
       );
     }
+
     throw new YoutubeExtractionError(
       'We couldn\'t access a transcript for this video. KWIP currently needs an available YouTube transcript or captions to understand the video.',
       'TRANSCRIPT_NOT_FOUND',
@@ -508,55 +527,61 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
   if (packageItems.length > 0) {
     transcriptItems = packageItems;
   } else {
-    const selectedTrack = selectBestCaptionTrack(tracks);
-    if (!selectedTrack) {
-      throw new YoutubeExtractionError(
-        'No compatible transcript tracks available for this video.',
-        'TRANSCRIPT_NOT_FOUND',
-        422
-      );
-    }
+    // Iterate over available tracks to find one that returns valid XML content
+    const orderedTracks = [...tracks].sort((a, b) => {
+      const aEng = a.languageCode?.toLowerCase().startsWith('en');
+      const bEng = b.languageCode?.toLowerCase().startsWith('en');
+      if (aEng && !bEng) return -1;
+      if (!aEng && bEng) return 1;
+      if (a.kind !== 'asr' && b.kind === 'asr') return -1;
+      if (a.kind === 'asr' && b.kind !== 'asr') return 1;
+      return 0;
+    });
 
-    console.log(
-      `[YouTube Transcript] Selected track: lang=${selectedTrack.languageCode}, kind=${selectedTrack.kind || 'manual'}, vssId=${selectedTrack.vssId}, method=${extractionMethod}`
-    );
-
-    // If selected track is non-English and translatable, try auto-translating to English by adding &tlang=en
-    let targetXmlUrl = selectedTrack.baseUrl;
-    if (!selectedTrack.languageCode.toLowerCase().startsWith('en') && !targetXmlUrl.includes('&tlang=')) {
-      targetXmlUrl = `${targetXmlUrl}&tlang=en`;
-    }
-
-    try {
-      const xmlRes = await fetch(targetXmlUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
-      });
-
-      if (!xmlRes.ok) {
-        // Fallback to original track URL if translation fetch failed
-        const originalRes = await fetch(selectedTrack.baseUrl);
-        if (!originalRes.ok) {
-          throw new YoutubeExtractionError('Failed to fetch YouTube caption track XML.', 'TRANSCRIPT_UNAVAILABLE', 422);
-        }
-        const xmlText = await originalRes.text();
-        transcriptItems = parseTranscriptXml(xmlText);
-      } else {
-        const xmlText = await xmlRes.text();
-        transcriptItems = parseTranscriptXml(xmlText);
+    for (const track of orderedTracks) {
+      let targetXmlUrl = track.baseUrl;
+      if (!track.languageCode.toLowerCase().startsWith('en') && !targetXmlUrl.includes('&tlang=')) {
+        targetXmlUrl = `${targetXmlUrl}&tlang=en`;
       }
-    } catch (err: any) {
-      if (err instanceof YoutubeExtractionError) throw err;
-      throw new YoutubeExtractionError('Failed to download or parse YouTube transcript XML.', 'TRANSCRIPT_PARSE_FAILED', 422);
+
+      try {
+        const xmlRes = await fetch(targetXmlUrl, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+          },
+        });
+
+        if (xmlRes.ok) {
+          const xmlText = await xmlRes.text();
+          if (xmlText.trim().length > 0) {
+            const parsed = parseTranscriptXml(xmlText);
+            if (parsed.length > 0) {
+              transcriptItems = parsed;
+              console.log(
+                `[YouTube Transcript] Successfully extracted track: lang=${track.languageCode}, kind=${track.kind || 'manual'}, method=${extractionMethod}`
+              );
+              break;
+            }
+          }
+        }
+      } catch (err: any) {
+        console.warn(`[YouTube Transcript] Track fetch warning for lang=${track.languageCode}:`, err?.message || err);
+      }
     }
   }
 
   if (!transcriptItems || transcriptItems.length === 0) {
+    if (isVerifiedPublic) {
+      throw new YoutubeExtractionError(
+        'We couldn\'t fetch caption data for this video. The YouTube caption service returned an empty track.',
+        'TRANSCRIPT_FETCH_FAILED',
+        502
+      );
+    }
     throw new YoutubeExtractionError(
-      'We couldn\'t access a transcript for this video. The transcript XML contained no text content.',
-      'TRANSCRIPT_PARSE_FAILED',
+      'We couldn\'t access a transcript for this video. KWIP currently needs an available YouTube transcript or captions to understand the video.',
+      'TRANSCRIPT_NOT_FOUND',
       422
     );
   }
