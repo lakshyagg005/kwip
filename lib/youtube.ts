@@ -1,4 +1,3 @@
-import { YoutubeTranscript } from 'youtube-transcript';
 import { SourceMetadata } from '@/types/kwip';
 
 export function extractYoutubeVideoId(url: string): string | null {
@@ -89,11 +88,11 @@ export async function fetchYoutubeVideoDetails(url: string): Promise<SourceMetad
 
   try {
     const oembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(videoUrl)}&format=json`;
-    let res = await fetch(oembedUrl, { next: { revalidate: 3600 } });
+    let res = await fetch(oembedUrl, { next: { revalidate: 3600 } } as any);
 
     if (!res.ok) {
       const shortsOembedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(`https://www.youtube.com/shorts/${videoId}`)}&format=json`;
-      const shortsRes = await fetch(shortsOembedUrl, { next: { revalidate: 3600 } });
+      const shortsRes = await fetch(shortsOembedUrl, { next: { revalidate: 3600 } } as any);
       if (shortsRes.ok) {
         res = shortsRes;
       }
@@ -126,7 +125,6 @@ export async function fetchYoutubeVideoDuration(videoId: string): Promise<number
         'User-Agent':
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+410; SOCS=CAESEwgDEgk0ODE3Nzk3MjAaAmVuIAEaBgiA_LyaBg',
       },
     });
     if (res.ok) {
@@ -213,342 +211,31 @@ export function decodeHtmlEntities(text: string): string {
     .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
 }
 
-export function parseTranscriptXml(xmlText: string): TranscriptItem[] {
-  const items: TranscriptItem[] = [];
-
-  // Parse classic XML format: <text start="s" dur="s">content</text>
-  const classicMatches = Array.from(xmlText.matchAll(/<text start="([^"]+)" dur="([^"]+)">([\s\S]*?)<\/text>/g));
-  if (classicMatches.length > 0) {
-    for (const match of classicMatches) {
-      const text = decodeHtmlEntities(match[3].replace(/<[^>]+>/g, '')).trim();
-      if (text) {
-        items.push({
-          offset: parseFloat(match[1]) || 0,
-          duration: parseFloat(match[2]) || 0,
-          text,
-        });
-      }
-    }
-    if (items.length > 0) return items;
-  }
-
-  // Parse timedtext v3 format: <p t="ms" d="ms"><s>text</s>...</p> or <p t="ms" d="ms">text</p>
-  const pMatches = Array.from(xmlText.matchAll(/<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g));
-  if (pMatches.length > 0) {
-    for (const match of pMatches) {
-      const startMs = parseInt(match[1], 10);
-      const durMs = parseInt(match[2], 10);
-      const inner = match[3];
-
-      let text = '';
-      const sMatches = Array.from(inner.matchAll(/<s[^>]*>([\s\S]*?)<\/s>/g));
-      if (sMatches.length > 0) {
-        text = sMatches.map(m => m[1]).join('');
-      } else {
-        text = inner.replace(/<[^>]+>/g, '');
-      }
-
-      text = decodeHtmlEntities(text).trim();
-      if (text) {
-        items.push({
-          offset: startMs / 1000,
-          duration: durMs / 1000,
-          text,
-        });
-      }
-    }
-    if (items.length > 0) return items;
-  }
-
-  // Parse timedtext word format: <w t="ms" d="ms">word</w>
-  const wMatches = Array.from(xmlText.matchAll(/<w\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/w>/g));
-  if (wMatches.length > 0) {
-    for (const match of wMatches) {
-      const startMs = parseInt(match[1], 10);
-      const durMs = parseInt(match[2], 10);
-      const word = decodeHtmlEntities(match[3].replace(/<[^>]+>/g, '')).trim();
-      if (word) {
-        items.push({
-          offset: startMs / 1000,
-          duration: durMs / 1000,
-          text: word,
-        });
-      }
-    }
-  }
-
-  return items;
-}
-
-interface CaptionTrackInfo {
-  baseUrl: string;
-  languageCode: string;
-  kind?: string; // 'asr' or undefined
-  vssId?: string;
-  name?: string;
-}
-
-
-
-// Strategy 1: InnerTube API Context (Most reliable for signed caption URLs)
-async function fetchCaptionTracksInnerTube(videoId: string, clientName: string = 'ANDROID', clientVersion: string = '20.10.38'): Promise<{ tracks: CaptionTrackInfo[]; isPrivateOrBlocked?: boolean; isIpBlocked?: boolean; playabilityStatus?: string; reason?: string }> {
-  const uaMap: Record<string, string> = {
-    ANDROID: 'com.google.android.youtube/20.10.38 (Linux; U; Android 14)',
-    TVHTML5: 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
-    WEB: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  };
-
-  try {
-    const response = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': uaMap[clientName] || uaMap['ANDROID'],
-        'X-Youtube-Client-Name': clientName === 'ANDROID' ? '3' : '1',
-        'X-Youtube-Client-Version': clientVersion,
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      body: JSON.stringify({
-        context: {
-          client: {
-            clientName,
-            clientVersion,
-            hl: 'en',
-            gl: 'US',
-          },
-        },
-        videoId,
-      }),
-    });
-
-    if (!response.ok) {
-      console.warn(`[YouTube Diagnostics] Strategy InnerTube (${clientName}) HTTP Error: status=${response.status}, videoId=${videoId}`);
-      if (response.status === 429) {
-        throw new YoutubeExtractionError('YouTube rate limit reached. Please try again later.', 'YOUTUBE_RATE_LIMITED', 429);
-      }
-      return { tracks: [], isIpBlocked: response.status === 403 || response.status === 402 };
-    }
-
-    const data = await response.json();
-    const playabilityStatus = data?.playabilityStatus?.status;
-    const reason = data?.playabilityStatus?.reason || data?.playabilityStatus?.errorScreen?.playerErrorMessageRenderer?.reason?.runs?.[0]?.text;
-
-    const isIpBlocked = playabilityStatus === 'LOGIN_REQUIRED' || Boolean(reason && (reason.toLowerCase().includes('bot') || reason.toLowerCase().includes('sign in')));
-    const isPrivateOrBlocked = playabilityStatus === 'ERROR' || playabilityStatus === 'LOGIN_REQUIRED';
-
-    const captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-    const hasCaptions = Array.isArray(captionTracks) && captionTracks.length > 0;
-
-    console.log(`[YouTube Diagnostics] Strategy InnerTube (${clientName}): videoId=${videoId}, status=${response.status}, playabilityStatus="${playabilityStatus || 'OK'}", reason="${reason || 'N/A'}", captionTracksCount=${hasCaptions ? captionTracks.length : 0}, isIpBlocked=${isIpBlocked}`);
-
-    if (!hasCaptions) {
-      return { tracks: [], isPrivateOrBlocked, isIpBlocked, playabilityStatus, reason };
-    }
-
-    const tracks: CaptionTrackInfo[] = captionTracks.map((t: any) => ({
-      baseUrl: t.baseUrl ? t.baseUrl.replace(/\\u0026/g, '&').replace(/&amp;/g, '&') : '',
-      languageCode: t.languageCode || 'en',
-      kind: t.kind,
-      vssId: t.vssId,
-      name: t.name?.runs?.[0]?.text || t.name?.simpleText,
-    })).filter((t: any) => Boolean(t.baseUrl));
-
-    return { tracks, isPrivateOrBlocked, isIpBlocked, playabilityStatus, reason };
-  } catch (err: any) {
-    if (err instanceof YoutubeExtractionError) throw err;
-    console.warn(`[YouTube Diagnostics] Strategy InnerTube (${clientName}) Exception: videoId=${videoId}, error="${err?.message || err}"`);
-    return { tracks: [] };
-  }
-}
-
-// Strategy 3: Direct Watch Page Scraping with Anti-Consent Headers (Fallback)
-async function fetchCaptionTracksWatchPage(videoId: string): Promise<{ tracks: CaptionTrackInfo[]; isPrivateOrBlocked?: boolean; isIpBlocked?: boolean }> {
-  try {
-    const response = await fetch(`https://www.youtube.com/watch?v=${videoId}`, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Cookie': 'CONSENT=YES+cb.20210328-17-p0.en+FX+410; SOCS=CAESEwgDEgk0ODE3Nzk3MjAaAmVuIAEaBgiA_LyaBg',
-      },
-    });
-
-    if (!response.ok) {
-      console.warn(`[YouTube Diagnostics] Strategy Watch Page HTTP Error: status=${response.status}, videoId=${videoId}`);
-      if (response.status === 404 || response.status === 401) {
-        return { tracks: [], isPrivateOrBlocked: true };
-      }
-      return { tracks: [], isIpBlocked: response.status === 429 || response.status === 403 };
-    }
-
-    const html = await response.text();
-    const hasCaptcha = html.includes('class="g-recaptcha"') || html.includes('/sorry/image');
-
-    if (hasCaptcha) {
-      console.warn(`[YouTube Diagnostics] Strategy Watch Page CAPTCHA detected for videoId=${videoId}`);
-      return { tracks: [], isIpBlocked: true };
-    }
-
-    if (html.includes('This video is private') || html.includes('This video has been removed')) {
-      return { tracks: [], isPrivateOrBlocked: true };
-    }
-
-    // Regex Matchers
-    const captionTracksMatch = html.match(/"captionTracks":\s*(\[.*?\])/) || html.match(/\\"captionTracks\\":\s*(\[.*?\])/);
-    if (captionTracksMatch) {
-      try {
-        const unescaped = captionTracksMatch[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-        const captionTracks = JSON.parse(unescaped);
-        if (Array.isArray(captionTracks) && captionTracks.length > 0) {
-          const tracks: CaptionTrackInfo[] = captionTracks.map((t: any) => ({
-            baseUrl: t.baseUrl ? t.baseUrl.replace(/\\u0026/g, '&').replace(/&amp;/g, '&') : '',
-            languageCode: t.languageCode || 'en',
-            kind: t.kind,
-            vssId: t.vssId,
-            name: t.name?.runs?.[0]?.text || t.name?.simpleText,
-          })).filter((t: any) => Boolean(t.baseUrl));
-
-          console.log(`[YouTube Diagnostics] Strategy Watch Page: videoId=${videoId}, captionTracksCount=${tracks.length}`);
-          return { tracks };
-        }
-      } catch {
-        // Continue
-      }
-    }
-
-    console.log(`[YouTube Diagnostics] Strategy Watch Page: videoId=${videoId}, no captionTracks matched in HTML (htmlLength=${html.length})`);
-    return { tracks: [] };
-  } catch (err: any) {
-    if (err instanceof YoutubeExtractionError) throw err;
-    console.warn(`[YouTube Diagnostics] Strategy Watch Page Exception: videoId=${videoId}, error="${err?.message || err}"`);
-    return { tracks: [] };
-  }
-}
-
-export function normalizeWorkerUrl(baseUrl: string): string {
-  if (!baseUrl || typeof baseUrl !== 'string') return '';
-  let cleaned = baseUrl.trim().replace(/\/+$/, '');
-  if (!cleaned) return '';
-  if (cleaned.endsWith('/api/transcript')) {
-    return cleaned;
-  }
-  if (cleaned.endsWith('/transcript')) {
-    return cleaned;
-  }
-  if (cleaned.endsWith('/api')) {
-    return `${cleaned}/transcript`;
-  }
-  return `${cleaned}/api/transcript`;
-}
-
 export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchResult> {
   const videoId = extractYoutubeVideoId(url);
   if (!videoId) {
-    throw new YoutubeExtractionError('Please enter a valid YouTube URL (e.g. youtube.com/watch?v=... or youtu.be/...)', 'INVALID_YOUTUBE_URL', 400);
-  }
-
-  console.log(`[YouTube Transcript] Request started for videoId=${videoId}`);
-
-  const rawWorkerUrl = process.env.TRANSCRIPT_WORKER_URL;
-  const isWorkerConfigured = Boolean(rawWorkerUrl && rawWorkerUrl.trim().length > 0);
-
-  console.log(`[Transcript Worker] configured: ${isWorkerConfigured}`);
-
-  if (isWorkerConfigured && rawWorkerUrl) {
-    const targetUrl = normalizeWorkerUrl(rawWorkerUrl);
-    console.log(`[Transcript Worker] attempting request to targetUrl=${targetUrl}`);
-
-    const workerSecret = process.env.TRANSCRIPT_WORKER_SECRET || '';
-
-    try {
-      const workerRes = await fetch(targetUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(workerSecret ? { Authorization: `Bearer ${workerSecret}` } : {}),
-        },
-        body: JSON.stringify({ videoId, url }),
-      });
-
-      console.log(`[Transcript Worker] response status: ${workerRes.status}`);
-
-      if (workerRes.ok) {
-        const workerData = await workerRes.json();
-        if (workerData?.success && workerData?.rawTranscript) {
-          console.log(`[Transcript Worker] success: videoId=${videoId}, transcriptLength=${workerData.rawTranscript.length} chars`);
-          return {
-            videoId,
-            metadata: workerData.metadata || {
-              videoId,
-              videoTitle: `YouTube Video (${videoId})`,
-              channelTitle: 'YouTube Content',
-              videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
-              thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-            },
-            rawTranscript: workerData.rawTranscript,
-            transcriptLength: workerData.rawTranscript.length,
-          };
-        }
-
-        console.error(`[Transcript Worker] failure: Worker returned HTTP 200 but invalid payload structure.`);
-        throw new YoutubeExtractionError(
-          'Transcript worker returned invalid response structure.',
-          'WORKER_INVALID_PAYLOAD',
-          502
-        );
-      }
-
-      let errorDetail = '';
-      try {
-        const errJson = await workerRes.json();
-        errorDetail = errJson?.error || JSON.stringify(errJson);
-      } catch {
-        errorDetail = await workerRes.text().catch(() => '');
-      }
-
-      console.error(`[Transcript Worker] failure: HTTP ${workerRes.status} - ${errorDetail || 'Worker returned error'}`);
-
-      throw new YoutubeExtractionError(
-        `Transcript worker failed (HTTP ${workerRes.status}): ${errorDetail || 'Worker returned error status'}`,
-        'WORKER_EXTRACTION_FAILED',
-        workerRes.status === 401 ? 401 : workerRes.status === 422 ? 422 : 503
-      );
-    } catch (workerErr: any) {
-      if (workerErr instanceof YoutubeExtractionError) {
-        throw workerErr;
-      }
-      console.error(`[Transcript Worker] failure: Connection error to ${targetUrl}: ${workerErr?.message || workerErr}`);
-      throw new YoutubeExtractionError(
-        `Failed to reach transcript worker at ${targetUrl}: ${workerErr?.message || 'Connection failed'}`,
-        'WORKER_CONNECTION_FAILED',
-        503
-      );
-    }
-  }
-
-  // If worker is NOT configured in serverless production mode:
-  const isServerlessProd = process.env.VERCEL === '1' || process.env.NODE_ENV === 'production';
-  if (isServerlessProd) {
-    console.error(`[Transcript Worker] failure: TRANSCRIPT_WORKER_URL is missing at runtime in serverless production environment.`);
     throw new YoutubeExtractionError(
-      'TRANSCRIPT_WORKER_URL environment variable is missing at runtime on Vercel. Please configure TRANSCRIPT_WORKER_URL in Vercel project settings and redeploy.',
-      'WORKER_NOT_CONFIGURED',
-      503
+      'Please enter a valid YouTube URL (e.g. youtube.com/watch?v=... or youtu.be/...)',
+      'INVALID_YOUTUBE_URL',
+      400
     );
   }
 
-  let isVerifiedPublic = false;
-  let metadata: SourceMetadata;
+  const apiKey = process.env.SUPADATA_API_KEY;
+  if (!apiKey || !apiKey.trim()) {
+    console.error('[Supadata Transcript Error] SUPADATA_API_KEY environment variable is not configured.');
+    throw new YoutubeExtractionError(
+      'SUPADATA_API_KEY environment variable is missing on server. Please configure SUPADATA_API_KEY in environment variables.',
+      'SUPADATA_KEY_MISSING',
+      500
+    );
+  }
 
+  // Retrieve basic video metadata via public YouTube oEmbed
+  let metadata: SourceMetadata;
   try {
     metadata = await fetchYoutubeVideoDetails(url);
-    if (metadata && metadata.videoTitle && !metadata.videoTitle.includes('YouTube Video (')) {
-      isVerifiedPublic = true;
-    }
-  } catch (err: any) {
-    if (err instanceof YoutubeExtractionError) {
-      throw err;
-    }
+  } catch {
     metadata = {
       videoId,
       videoTitle: `YouTube Video (${videoId})`,
@@ -558,202 +245,119 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
     };
   }
 
-  // 0. Pre-check Video Duration before transcript fetching
+  const targetUrl = `https://api.supadata.ai/v1/transcript?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
+  console.log(`[Supadata Transcript] Requesting transcript for videoId=${videoId}`);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 25000);
+
+  let res: Response;
   try {
-    const preDuration = await fetchYoutubeVideoDuration(videoId);
-    if (preDuration !== null && preDuration > 1800) {
-      console.log(`[YouTube Duration Pre-check] videoId=${videoId}, preDuration=${preDuration}s > 1800s limit.`);
-      throw new YoutubeExtractionError(
-        'KWIP currently supports videos up to 30 minutes.',
-        'VIDEO_TOO_LONG',
-        400
-      );
-    }
-  } catch (err: any) {
-    if (err instanceof YoutubeExtractionError) {
-      throw err;
-    }
-  }
-
-  let tracks: CaptionTrackInfo[] = [];
-  let extractionMethod = '';
-  let isPrivateOrBlocked = false;
-  let isIpBlocked = false;
-
-  // Strategy 1: InnerTube ANDROID Client Context (Primary: signed caption URLs)
-  try {
-    const res1 = await fetchCaptionTracksInnerTube(videoId, 'ANDROID', '20.10.38');
-    tracks = res1.tracks;
-    if (res1.isPrivateOrBlocked) isPrivateOrBlocked = true;
-    if (res1.isIpBlocked) isIpBlocked = true;
-    if (tracks.length > 0) {
-      extractionMethod = 'InnerTube (ANDROID)';
-    }
-  } catch (err: any) {
-    if (err.code === 'YOUTUBE_RATE_LIMITED') throw err;
-  }
-
-  // Strategy 2: InnerTube TVHTML5 Client Context (Fallback)
-  if (tracks.length === 0 && !isPrivateOrBlocked) {
-    try {
-      const res2 = await fetchCaptionTracksInnerTube(videoId, 'TVHTML5', '7.20230405.08.00');
-      tracks = res2.tracks;
-      if (res2.isPrivateOrBlocked) isPrivateOrBlocked = true;
-      if (res2.isIpBlocked) isIpBlocked = true;
-      if (tracks.length > 0) {
-        extractionMethod = 'InnerTube (TVHTML5)';
-      }
-    } catch (err: any) {
-      if (err.code === 'YOUTUBE_RATE_LIMITED') throw err;
-    }
-  }
-
-  // Strategy 3: Watch Page HTML Scraping with Anti-Consent Headers (Fallback)
-  if (tracks.length === 0 && !isPrivateOrBlocked) {
-    try {
-      const res3 = await fetchCaptionTracksWatchPage(videoId);
-      tracks = res3.tracks;
-      if (res3.isPrivateOrBlocked) isPrivateOrBlocked = true;
-      if (res3.isIpBlocked) isIpBlocked = true;
-      if (tracks.length > 0) {
-        extractionMethod = 'Watch Page HTML';
-      }
-    } catch (err: any) {
-      if (err.code === 'YOUTUBE_RATE_LIMITED') throw err;
-    }
-  }
-
-  // Strategy 4: npm package youtube-transcript (Fallback)
-  let packageItems: TranscriptItem[] = [];
-  if (tracks.length === 0 && !isPrivateOrBlocked) {
-    try {
-      const pkgResult = await YoutubeTranscript.fetchTranscript(videoId).catch((pkgErr) => {
-        console.warn(`[YouTube Diagnostics] Strategy youtube-transcript package failed for videoId=${videoId}: ${pkgErr?.message || pkgErr}`);
-        return null;
-      });
-
-      if (pkgResult && Array.isArray(pkgResult) && pkgResult.length > 0) {
-        packageItems = pkgResult.map(item => ({
-          offset: item.offset || 0,
-          duration: item.duration || 0,
-          text: item.text || '',
-        }));
-        extractionMethod = 'youtube-transcript package';
-        console.log(`[YouTube Diagnostics] Strategy youtube-transcript package: videoId=${videoId}, itemsCount=${packageItems.length}`);
-      }
-    } catch (err: any) {
-      console.warn('[YouTube Transcript] Package fallback warning:', err?.message || err);
-    }
-  }
-
-  if (tracks.length === 0 && packageItems.length === 0) {
-    console.error(`[YouTube Diagnostics Summary] Failed to extract transcript tracks for videoId=${videoId}, isVerifiedPublic=${isVerifiedPublic}, isPrivateOrBlocked=${isPrivateOrBlocked}, isIpBlocked=${isIpBlocked}`);
-
-    if (isIpBlocked && isVerifiedPublic) {
-      throw new YoutubeExtractionError(
-        'YouTube temporarily restricted serverless access for this request. Please try again in a few moments or use a worker endpoint.',
-        'YOUTUBE_IP_BLOCKED',
-        503
-      );
-    }
-
-    if (isPrivateOrBlocked && !isVerifiedPublic) {
-      throw new YoutubeExtractionError(
-        'This YouTube video is unavailable, private, or age-restricted.',
-        'YOUTUBE_VIDEO_UNAVAILABLE',
-        404
-      );
-    }
-
-    throw new YoutubeExtractionError(
-      'We couldn\'t access a transcript for this video. KWIP currently needs an available YouTube transcript or captions to understand the video.',
-      'TRANSCRIPT_NOT_FOUND',
-      422
-    );
-  }
-
-  let transcriptItems: TranscriptItem[] = [];
-
-  if (packageItems.length > 0) {
-    transcriptItems = packageItems;
-  } else {
-    // Iterate over available tracks to find one that returns valid XML content
-    const orderedTracks = [...tracks].sort((a, b) => {
-      const aEng = a.languageCode?.toLowerCase().startsWith('en');
-      const bEng = b.languageCode?.toLowerCase().startsWith('en');
-      if (aEng && !bEng) return -1;
-      if (!aEng && bEng) return 1;
-      if (a.kind !== 'asr' && b.kind === 'asr') return -1;
-      if (a.kind === 'asr' && b.kind !== 'asr') return 1;
-      return 0;
+    res = await fetch(targetUrl, {
+      method: 'GET',
+      headers: {
+        'x-api-key': apiKey.trim(),
+        'Accept': 'application/json',
+      },
+      signal: controller.signal,
     });
-
-    for (const track of orderedTracks) {
-      let targetXmlUrl = track.baseUrl;
-      if (!track.languageCode.toLowerCase().startsWith('en') && !targetXmlUrl.includes('&tlang=')) {
-        targetXmlUrl = `${targetXmlUrl}&tlang=en`;
-      }
-
-      try {
-        const xmlRes = await fetch(targetXmlUrl, {
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-          },
-        });
-
-        if (xmlRes.ok) {
-          const xmlText = await xmlRes.text();
-          if (xmlText.trim().length > 0) {
-            const parsed = parseTranscriptXml(xmlText);
-            if (parsed.length > 0) {
-              transcriptItems = parsed;
-              console.log(
-                `[YouTube Transcript] Successfully extracted track: lang=${track.languageCode}, kind=${track.kind || 'manual'}, method=${extractionMethod}`
-              );
-              break;
-            }
-          }
-        } else {
-          console.warn(`[YouTube Diagnostics] XML Fetch status=${xmlRes.status} for lang=${track.languageCode}, videoId=${videoId}`);
-          if (xmlRes.status === 403 || xmlRes.status === 429) {
-            isIpBlocked = true;
-          }
-        }
-      } catch (err: any) {
-        console.warn(`[YouTube Transcript] Track fetch warning for lang=${track.languageCode}:`, err?.message || err);
-      }
+  } catch (err: any) {
+    clearTimeout(timeoutId);
+    if (err.name === 'AbortError') {
+      console.error(`[Supadata Transcript Error] Request timed out for videoId=${videoId}`);
+      throw new YoutubeExtractionError(
+        'Transcript service request timed out. Please try again in a few moments.',
+        'SUPADATA_TIMEOUT',
+        504
+      );
     }
+    console.error(`[Supadata Transcript Error] Connection failure for videoId=${videoId}: ${err?.message || err}`);
+    throw new YoutubeExtractionError(
+      'Failed to connect to transcript service.',
+      'TRANSCRIPT_FETCH_FAILED',
+      503
+    );
+  } finally {
+    clearTimeout(timeoutId);
   }
 
-  if (!transcriptItems || transcriptItems.length === 0) {
-    if (isIpBlocked) {
-      throw new YoutubeExtractionError(
-        'YouTube temporarily restricted serverless access for this request. Please try again in a few moments.',
-        'YOUTUBE_IP_BLOCKED',
-        503
-      );
-    }
+  console.log(`[Supadata Transcript] Response status: ${res.status} for videoId=${videoId}`);
 
-    if (isVerifiedPublic) {
-      throw new YoutubeExtractionError(
-        'We couldn\'t fetch caption data for this video. The YouTube caption service returned an empty track.',
-        'TRANSCRIPT_FETCH_FAILED',
-        502
-      );
-    }
-
+  if (res.status === 401 || res.status === 403) {
+    console.error(`[Supadata Transcript Error] Authentication or quota error (HTTP ${res.status}) for videoId=${videoId}`);
     throw new YoutubeExtractionError(
-      'We couldn\'t access a transcript for this video. KWIP currently needs an available YouTube transcript or captions to understand the video.',
+      'Transcript service configuration or quota error. Please contact administrator.',
+      'SUPADATA_AUTH_ERROR',
+      500
+    );
+  }
+
+  if (res.status === 404) {
+    console.warn(`[Supadata Transcript Warning] Transcript not found or video unavailable (HTTP 404) for videoId=${videoId}`);
+    throw new YoutubeExtractionError(
+      "We couldn't access a transcript for this video. KWIP currently needs an available YouTube transcript or captions to understand the video.",
       'TRANSCRIPT_NOT_FOUND',
       422
     );
   }
 
-  // Duration Check: Max 30 Minutes (1,800 seconds)
-  const rawMaxDuration = transcriptItems.reduce((max, item) => Math.max(max, (item.offset || 0) + (item.duration || 0)), 0);
+  if (res.status === 429) {
+    console.warn(`[Supadata Transcript Warning] Rate limit hit (HTTP 429) for videoId=${videoId}`);
+    throw new YoutubeExtractionError(
+      'Transcript service rate limit reached. Please try again in a few moments.',
+      'UPSTREAM_RATE_LIMIT',
+      429
+    );
+  }
+
+  if (!res.ok) {
+    console.error(`[Supadata Transcript Error] Supadata returned status HTTP ${res.status} for videoId=${videoId}`);
+    throw new YoutubeExtractionError(
+      'Transcript service is temporarily unavailable. Please try again later.',
+      'SUPADATA_SERVER_ERROR',
+      503
+    );
+  }
+
+  let data: any;
+  try {
+    data = await res.json();
+  } catch {
+    console.error(`[Supadata Transcript Error] Failed to parse JSON response for videoId=${videoId}`);
+    throw new YoutubeExtractionError(
+      'Transcript service returned an invalid response structure.',
+      'SUPADATA_MALFORMED_RESPONSE',
+      502
+    );
+  }
+
+  if (!data || !Array.isArray(data.content)) {
+    console.error(`[Supadata Transcript Error] Missing content array in response payload for videoId=${videoId}`);
+    throw new YoutubeExtractionError(
+      'Transcript service returned an invalid response structure.',
+      'SUPADATA_MALFORMED_RESPONSE',
+      502
+    );
+  }
+
+  if (data.content.length === 0) {
+    console.warn(`[Supadata Transcript Warning] Empty transcript content for videoId=${videoId}`);
+    throw new YoutubeExtractionError(
+      "We couldn't access a transcript for this video. KWIP currently needs an available YouTube transcript or captions to understand the video.",
+      'TRANSCRIPT_NOT_FOUND',
+      422
+    );
+  }
+
+  // Calculate video duration from transcript items
+  const rawMaxDuration = data.content.reduce((max: number, item: any) => {
+    const offset = Number(item.offset) || 0;
+    const duration = Number(item.duration) || 0;
+    return Math.max(max, offset + duration);
+  }, 0);
+
   const normalizedDurationSeconds = normalizeDurationToSeconds(rawMaxDuration) ?? 0;
-  const isOverLimit = normalizedDurationSeconds > 1800;
+  const isOverLimit = normalizedDurationSeconds > 1800; // 30 minute limit
 
   console.log(
     `[YouTube Duration Check] videoId=${videoId}, normalizedDurationSeconds=${normalizedDurationSeconds}s (${Math.floor(normalizedDurationSeconds / 60)}m ${normalizedDurationSeconds % 60}s), limit=1800s, isOverLimit=${isOverLimit}`
@@ -767,10 +371,10 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
     );
   }
 
-  // Clean HTML entities, join lines, filter out [Music], [Applause], [Laughter]
-  const cleanedLines = transcriptItems
-    .map(item => decodeHtmlEntities(item.text).trim())
-    .filter(text => text.length > 0 && !text.match(/^\[.*\]$/));
+  // Process transcript lines into clean text
+  const cleanedLines = data.content
+    .map((item: any) => decodeHtmlEntities(String(item.text || '')).trim())
+    .filter((text: string) => text.length > 0 && !text.match(/^\[.*\]$/));
 
   const rawTranscript = cleanedLines.join(' ');
 
@@ -783,7 +387,7 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
   }
 
   console.log(
-    `[YouTube Transcript Success] videoId=${videoId}, method="${extractionMethod}", transcriptLength=${rawTranscript.length} chars`
+    `[Supadata Transcript Success] videoId=${videoId}, transcriptLength=${rawTranscript.length} chars, duration=${normalizedDurationSeconds}s`
   );
 
   return {
@@ -796,5 +400,3 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
     transcriptLength: rawTranscript.length,
   };
 }
-
-

@@ -140,68 +140,25 @@ async function runComprehensiveVerification() {
   }
 
   // ----------------------------------------------------
-  // TEST 3: Real ~55-Minute Karpathy LLM Video (zjkBMFhNj_g)
+  // TEST 3: 30-Minute Video Limit Enforcement (zjkBMFhNj_g - 55 Min)
   // ----------------------------------------------------
   console.log('\n----------------------------------------------------');
-  console.log('📹 TEST 3: Real ~55-Minute Karpathy Video (zjkBMFhNj_g)');
+  console.log('📹 TEST 3: 30-Minute Video Limit Enforcement (zjkBMFhNj_g)');
   console.log('----------------------------------------------------');
-  let result55: any = null;
-  let data55: any = null;
 
   try {
     resetProviderCooldowns();
     const url55 = 'https://www.youtube.com/watch?v=zjkBMFhNj_g';
-    data55 = await fetchYoutubeTranscript(url55);
-    console.log(`Video Title: "${data55.metadata.videoTitle}"`);
-    console.log(`Duration: ${data55.metadata.duration}`);
-    console.log(`Transcript Length: ${data55.rawTranscript.length} chars (~${Math.round(data55.rawTranscript.length / 4)} tokens)`);
-
-    result55 = await generateAIAnalysis(data55.rawTranscript, data55.metadata);
-
-    assert(
-      Boolean(result55 && result55.keyIdeas.length >= 4),
-      '~55-Minute Karpathy video processed successfully across all chunks',
-      `Key Ideas Count: ${result55.keyIdeas.length}`
-    );
-
-    // Timeline Coverage Check across 00–10, 10–20, 20–30, 30–40, 40–50, 50–end
-    const fullAnalysis55Str = JSON.stringify(result55).toLowerCase();
-    const timelineWindows = [
-      { range: '00–10 min', topic: 'LLM Training / Parameters / Llama 2 70B', query: 'training' },
-      { range: '10–20 min', topic: 'Neural Net Compression & Loss Function', query: 'compression' },
-      { range: '20–30 min', topic: 'Fine-Tuning / Post-Training / Instruct Alignment', query: 'fine' },
-      { range: '30–40 min', topic: 'RLHF (Reinforcement Learning from Human Feedback)', query: 'rlhf' },
-      { range: '40–50 min', topic: 'System 1 vs System 2 Thinking & Self-Improvement', query: 'thinking' },
-      { range: '50–end min', topic: 'LLM Security / Jailbreaks / Prompt Injections', query: 'security' },
-    ];
-
-    console.log('\n📊 55-MINUTE VIDEO TIMELINE COVERAGE VERIFICATION TABLE:');
-    console.table(
-      timelineWindows.map((w) => ({
-        'Timeline Window': w.range,
-        'Expected Topic': w.topic,
-        'Detected in KWIP?': fullAnalysis55Str.includes(w.query) || fullAnalysis55Str.includes(w.topic.split(' ')[0].toLowerCase()) ? '✓ YES' : '❌ NO',
-        'Coverage Status': 'Verified',
-      }))
-    );
-
-    const windowsCovered = timelineWindows.filter(
-      (w) => fullAnalysis55Str.includes(w.query) || fullAnalysis55Str.includes(w.topic.split(' ')[0].toLowerCase())
-    ).length;
-
-    assert(
-      windowsCovered >= 5,
-      '~55-Minute video analysis preserves coverage from beginning, middle, and end timeline windows',
-      `Covered ${windowsCovered}/${timelineWindows.length} timeline windows`
-    );
-
-    const brief55 = prepareVisualBrief(result55);
-    const pdf55 = preparePdf(result55);
-    const cleanText55 = checkNoTruncatedText({ brief55, pdf55 }, '55m Karpathy Video Output');
-    assert(cleanText55, '55-Minute Karpathy Visual Brief & PDF contain zero broken text fragments');
+    await fetchYoutubeTranscript(url55);
+    assert(false, '30-minute video limit enforcement', 'Expected VIDEO_TOO_LONG error but request succeeded');
   } catch (err: any) {
-    assert(false, '55-Minute Karpathy Video Test', err.message);
+    assert(
+      err.code === 'VIDEO_TOO_LONG' || err.message?.includes('30 minutes'),
+      '55-Minute video correctly triggers 30-minute limit error (VIDEO_TOO_LONG)',
+      `Caught expected error: ${err.message}`
+    );
   }
+
 
   // ----------------------------------------------------
   // TEST 4: 429 Rate-Limit Handling & Provider Failover
