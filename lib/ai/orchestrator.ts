@@ -27,11 +27,10 @@ const PROVIDERS: ProviderConfig[] = [
     name: 'Groq',
     apiKeyEnv: 'GROQ_API_KEY',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+    // Only confirmed-active Groq models. Do NOT add deprecated llama-3.1/3.3 variants.
     models: [
-      'openai/gpt-oss-120b',
-      'llama-3.3-70b-versatile',
-      'llama-3.1-8b-instant',
-      'gemma2-9b-it',
+      'openai/gpt-oss-120b',  // primary — confirmed 200 in production
+      'openai/gpt-oss-20b',   // secondary — smaller, lower rate-limit pressure
     ],
     supportsJsonMode: true,
   },
