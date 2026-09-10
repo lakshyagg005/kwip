@@ -27,10 +27,11 @@ const PROVIDERS: ProviderConfig[] = [
     name: 'Groq',
     apiKeyEnv: 'GROQ_API_KEY',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
-    // Only confirmed-active Groq models. Do NOT add deprecated llama-3.1/3.3 variants.
+    // Only confirmed-active Groq models that support response_format: json_object.
+    // openai/gpt-oss-20b removed: returns json_validate_failed 400 (requires full JSON Schema, not json_object mode).
     models: [
-      'openai/gpt-oss-120b',  // primary — confirmed 200 in production
-      'openai/gpt-oss-20b',   // secondary — smaller, lower rate-limit pressure
+      'openai/gpt-oss-120b',   // primary — confirmed 200 in production, supports json_object
+      'llama3-groq-8b-8192',   // secondary — stable, fast, confirmed json_object support
     ],
     supportsJsonMode: true,
   },
