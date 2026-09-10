@@ -1,8 +1,8 @@
 'use client';
 
 import React, { useState } from 'react';
-import { KwipAnalysisResult, TemplateStyle } from '@/types/kwip';
-import { TEMPLATE_THEMES } from '@/templates/styles';
+import { KwipAnalysisResult } from '@/types/kwip';
+
 import { YoutubeIcon } from '@/components/ui/YoutubeIcon';
 import { ChevronLeft, ChevronRight, Download, Quote, FileText } from 'lucide-react';
 import { downloadCarouselSlide, downloadCarouselDeckAsPdf } from '@/lib/export';
@@ -173,10 +173,9 @@ const SingleSlideCanvas: React.FC<SingleSlideCanvasProps> = ({
   id,
   isFullCanvas = false,
 }) => {
-  const bodyRef = React.useRef<HTMLDivElement>(null);
-  const [contentScale, setContentScale] = useState(1);
+  const slideRef = React.useRef<HTMLDivElement>(null);
+  const [slideScale, setSlideScale] = useState(1);
 
-  const theme = TEMPLATE_THEMES[(styleKey as TemplateStyle) || 'editorial'] || TEMPLATE_THEMES.editorial;
   const fontFamily =
     styleKey === 'editorial' || styleKey === 'academic'
       ? 'Georgia, Cambria, serif'
@@ -199,20 +198,23 @@ const SingleSlideCanvas: React.FC<SingleSlideCanvasProps> = ({
     Boolean(slide.quote) ||
     Boolean(slide.stat);
 
-  // Runtime safety bounds check to guarantee zero bottom overflow
+  // Scale the ENTIRE slide (header + body + footer) to fit the preview container.
+  // This prevents the footer from being clipped by overflow-hidden on dense slides.
   React.useEffect(() => {
-    if (!bodyRef.current) return;
+    if (isFullCanvas || !slideRef.current) return;
+    const el = slideRef.current;
     const checkOverflow = () => {
-      if (bodyRef.current) {
-        const scrollH = bodyRef.current.scrollHeight;
-        const clientH = bodyRef.current.clientHeight;
+      // Reset first so scrollHeight reflects natural size
+      setSlideScale(1);
+      requestAnimationFrame(() => {
+        if (!el) return;
+        const scrollH = el.scrollHeight;
+        const clientH = el.clientHeight;
         if (scrollH > clientH && clientH > 0) {
-          const ratio = Math.max(clientH / scrollH, 0.85);
-          setContentScale(ratio);
-        } else {
-          setContentScale(1);
+          // Scale down the whole slide, min 0.65 to keep text legible
+          setSlideScale(Math.max(clientH / scrollH, 0.65));
         }
-      }
+      });
     };
     checkOverflow();
   }, [slide, isFullCanvas]);
@@ -220,12 +222,18 @@ const SingleSlideCanvas: React.FC<SingleSlideCanvasProps> = ({
   return (
     <div
       id={id}
+      ref={!isFullCanvas ? slideRef : undefined}
       className={`w-full h-full ${
         isFullCanvas ? (isHighDensity ? 'p-12 md:p-14' : 'p-16 md:p-20') : 'p-6 md:p-8'
       } flex flex-col justify-between select-none relative bg-white text-slate-900 ${
         styleKey === 'dark' ? 'bg-slate-950 text-slate-100' : ''
       }`}
-      style={containerStyle}
+      style={{
+        ...containerStyle,
+        ...(!isFullCanvas && slideScale < 1
+          ? { transform: `scale(${slideScale})`, transformOrigin: 'top center' }
+          : {}),
+      }}
     >
       {/* TOP SLIDE HEADER */}
       <div className="flex items-center justify-between border-b pb-4 border-slate-200 dark:border-slate-800 shrink-0">
@@ -244,9 +252,7 @@ const SingleSlideCanvas: React.FC<SingleSlideCanvasProps> = ({
 
       {/* MAIN SLIDE CONTENT BODY */}
       <div
-        ref={bodyRef}
         className="my-auto py-4 space-y-4 flex-1 flex flex-col justify-center"
-        style={contentScale < 1 ? { transform: `scale(${contentScale})`, transformOrigin: 'center center' } : undefined}
       >
         <h2
           className={`font-extrabold tracking-tight leading-tight text-slate-950 dark:text-slate-50 ${

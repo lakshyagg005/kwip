@@ -100,6 +100,12 @@ async function generateDirectAIAnalysis(
   const systemPrompt = `You are KWIP, an elite content strategist and source-grounded visual summary engine.
 Your task is to analyze a YouTube video transcript and transform it into high-impact visual assets.
 
+LANGUAGE REQUIREMENT:
+- Identify the language of the provided transcript.
+- Write ALL output fields (title, hook, executiveSummary, keyIdeas titles/summaries/explanations/examples, statistics, quotes, actionSteps, finalTakeaway) in that SAME language.
+- Do NOT translate the content into any other language. If the transcript is in English, output in English. If in Spanish, output in Spanish. Match exactly.
+- Quotes MUST be verbatim from the transcript in the transcript's original language.
+
 CRITICAL ACCURACY & FIDELITY INSTRUCTIONS:
 1. Output MUST be ONLY valid JSON adhering strictly to the JSON schema structure below. No markdown wrappers (\`\`\`json).
 2. SOURCE FIDELITY & NO HALLUCINATION:
@@ -380,6 +386,8 @@ async function analyzeSingleChunk(
 ): Promise<ChunkAnalysisResult | null> {
   const systemPrompt = `You are KWIP Section Analyzer. Analyze section ${chunk.index} of ${chunk.totalChunks} (${chunk.timeRangeLabel || chunk.sectionLabel}) of a YouTube video transcript. Extract ONLY facts present in the text. Output strict valid JSON (no markdown).
 
+LANGUAGE REQUIREMENT: Identify the language of the transcript section below and write ALL output fields (summary, keyIdeas titles/summaries/explanations/examples, statistics, quotes, actionSteps) in that SAME language. Do NOT translate into any other language.
+
 SCHEMA: {"summary":"1-2 sentences","keyIdeas":[{"number":1,"title":"","summary":"","explanation":"","example":"","tag":""}],"statistics":[{"value":"","label":"","context":""}],"quotes":[{"text":"","speaker":"","context":""}],"actionSteps":[{"stepNumber":1,"action":"","impact":""}]}
 
 Rules: No hallucination. If no stats/quotes exist, return []. Do NOT explain your reasoning.`;
@@ -440,6 +448,8 @@ Actions: ${JSON.stringify(c.actionSteps)}`
     .join('\n\n');
 
   const systemPrompt = `You are KWIP Master Synthesizer. Merge section findings into one unified analysis. Output strict valid JSON.
+
+LANGUAGE REQUIREMENT: The section findings below were extracted from a transcript. Identify the language used in those findings and write ALL output fields in that SAME language. Do NOT translate into any other language.
 
 JSON SCHEMA:
 {"contentType":"educational|podcast|tutorial|business|documentary","title":"max 10 words","hook":"1-2 sentences","executiveSummary":"2-4 sentences","keyIdeas":[{"number":1,"title":"","summary":"","explanation":"","example":"","tag":""}],"framework":{"title":"","subtitle":"","steps":[{"stepNumber":1,"title":"","description":""}]},"statistics":[{"value":"","label":"","context":""}],"quotes":[{"text":"","speaker":"","context":""}],"actionSteps":[{"stepNumber":1,"action":"","impact":""}],"finalTakeaway":""}`;
