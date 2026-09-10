@@ -12,10 +12,11 @@ export interface ProviderRequestOptions {
   requestId?: string;
   /**
    * Hard deadline: epoch ms by which this AI call must complete.
-   * If the call cannot START (i.e. a 429 wait would exceed the deadline),
-   * the orchestrator throws immediately rather than blocking.
+   * If the call cannot START before deadline, the orchestrator throws immediately.
    */
   deadlineMs?: number;
+  /** Optional chunk index for multi-chunk trace logging. */
+  chunkIndex?: number;
 }
 
 export interface ProviderConfig {
@@ -29,12 +30,12 @@ export interface ProviderConfig {
 // ---------------------------------------------------------------------------
 // Provider registry — order determines priority (first = highest priority).
 //
-// Primary Groq model: openai/gpt-oss-120b (confirmed 200 OK in production).
-// No fallback models — if the primary is 429'd we fail fast so the deadline
-// is not burned waiting through cascading retries.
-//
-// OpenRouter / NVIDIA NIM act as provider-level fallbacks only when Groq key
-// is absent or Groq is on cooldown.
+// Strategy:
+//   Groq 200      → return result immediately. OpenRouter = 0 calls.
+//   Groq 429/4xx  → set circuit-breaker, immediately cascade to OpenRouter.
+//                   NO sleep. NO retry on the same provider.
+//   OR  200       → return result immediately. NVIDIA = 0 calls.
+//   All fail      → throw AI_ALL_PROVIDERS_FAILED.
 // ---------------------------------------------------------------------------
 const PROVIDERS: ProviderConfig[] = [
   {
@@ -49,7 +50,7 @@ const PROVIDERS: ProviderConfig[] = [
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     defaultModel: 'meta-llama/llama-3.3-70b-instruct:free',
     extraHeaders: {
-      'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || process.env.NEXT_PUBLIC_SITE_URL || 'https://kwip-brown.vercel.app/',
+      'HTTP-Referer': 'https://kwip-brown.vercel.app/',
       'X-Title': 'KWIP Visual Summary Engine',
     },
   },
@@ -77,7 +78,7 @@ export function getProviderCooldown(providerName: string): number {
 export function setProviderCooldown(providerName: string, durationSeconds: number): void {
   const until = Date.now() + durationSeconds * 1000;
   cooldownUntilMap.set(providerName, until);
-  console.warn(`[CircuitBreaker] ${providerName} on cooldown for ${durationSeconds}s.`);
+  console.warn(`[CircuitBreaker] ${providerName} on cooldown for ${durationSeconds}s (until ${new Date(until).toISOString()}).`);
 }
 
 /** Clear all cooldowns (for testing). */
@@ -96,29 +97,27 @@ function msUntilDeadline(deadlineMs: number | undefined): number {
 }
 
 /**
- * Parse Groq rate-limit headers and return the recommended wait in seconds.
- * Caps at 90s to avoid burning excessive deadline.
+ * Parse rate-limit headers and return the recommended cooldown in seconds.
+ * Used ONLY to set the circuit-breaker duration — we never sleep for this long.
+ * Caps at 60s.
  */
-function parseGroqRetryAfter(headers: Headers): number {
-  // Prefer the explicit retry-after header first
+function parseRetryAfterSeconds(headers: Headers): number {
   const retryAfter = headers.get('retry-after');
   if (retryAfter) {
     const parsed = parseInt(retryAfter, 10);
-    if (!isNaN(parsed) && parsed > 0) return Math.min(parsed, 90);
+    if (!isNaN(parsed) && parsed > 0) return Math.min(parsed, 60);
   }
 
-  // x-ratelimit-reset-requests / x-ratelimit-reset-tokens are ISO timestamps or seconds
   for (const hdr of ['x-ratelimit-reset-requests', 'x-ratelimit-reset-tokens']) {
     const val = headers.get(hdr);
     if (val) {
-      // Could be seconds like "3" or "3.5s" or a timestamp
       const stripped = val.replace(/s$/i, '');
       const parsed = parseFloat(stripped);
-      if (!isNaN(parsed) && parsed > 0) return Math.min(Math.ceil(parsed), 90);
+      if (!isNaN(parsed) && parsed > 0) return Math.min(Math.ceil(parsed), 60);
     }
   }
 
-  return 20; // safe conservative default
+  return 30; // conservative default cooldown for circuit breaker
 }
 
 // ---------------------------------------------------------------------------
@@ -126,49 +125,51 @@ function parseGroqRetryAfter(headers: Headers): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Execute a single AI completion with deadline-aware 429 handling.
+ * Execute a single AI completion with provider fallback.
  *
- * Design:
- * - ONE attempt per provider model. No silent inner while-loop retries.
- * - On 429: read retry-after. If waiting would exceed deadline, throw immediately.
- *   Otherwise wait, then try once more on the SAME model (1 retry max).
- * - On 5xx: one immediate retry after 500ms, deadline-checked.
- * - Never blindly sleep for 30–60s and cascade to the next provider.
- * - requestId and deadlineMs propagate to all log lines.
+ * Fallback policy (CRITICAL):
+ * - Groq 200      → return immediately. OpenRouter = 0 calls.
+ * - Groq 429      → set circuit-breaker, immediately continue to OpenRouter.
+ *                   NO sleep. NO retry on the same provider.
+ * - Groq 4xx      → immediately continue to next provider.
+ * - Groq 5xx      → one 500ms retry, then cascade if still failing.
+ * - OpenRouter 200 → return immediately. NVIDIA = 0 calls.
+ * - All fail       → throw AI_ALL_PROVIDERS_FAILED.
+ *
+ * Circuit breaker: once a provider is 429'd, it is marked on cooldown.
+ * Subsequent chunk calls in the same request skip it without sleeping.
  */
 export async function executeAICompletion(
   options: ProviderRequestOptions
 ): Promise<{ content: string; providerName: string; latencyMs: number }> {
   const rid = options.requestId ? `[${options.requestId}]` : '[?]';
+  const chunkTag = options.chunkIndex !== undefined ? ` chunk=${options.chunkIndex}` : '';
   const errors: string[] = [];
 
   for (const provider of PROVIDERS) {
-    // Deadline check before starting a new provider
+    // ── Deadline check ──────────────────────────────────────────────────────
     const remainingMs = msUntilDeadline(options.deadlineMs);
     if (remainingMs < 5000) {
-      console.warn(`[Orchestrator] ${rid} Deadline reached before trying ${provider.name}. Aborting.`);
+      console.warn(`[Orchestrator] ${rid}${chunkTag} Deadline reached before trying ${provider.name}. Aborting.`);
       errors.push(`${provider.name}: Deadline exceeded`);
       break;
     }
 
+    // ── API key check ────────────────────────────────────────────────────────
     const apiKey = process.env[provider.apiKeyEnv];
     if (!apiKey) {
-      console.warn(`[Orchestrator] ${rid} ${provider.name} skipped: ${provider.apiKeyEnv} not set.`);
+      console.warn(`[Orchestrator] ${rid}${chunkTag} ${provider.name} skipped: ${provider.apiKeyEnv} not set.`);
       errors.push(`${provider.name}: Missing API key`);
       continue;
     }
 
+    // ── Circuit breaker — skip immediately, do NOT sleep ────────────────────
+    // If this provider was 429'd earlier in this request, skip it instantly.
     const cooldownSec = getProviderCooldown(provider.name);
     if (cooldownSec > 0) {
-      // Only skip if the cooldown would exceed the deadline
-      if (cooldownSec * 1000 > remainingMs) {
-        console.warn(`[Orchestrator] ${rid} ${provider.name} cooldown (${cooldownSec}s) exceeds remaining deadline. Skipping.`);
-        errors.push(`${provider.name}: Cooldown exceeds deadline`);
-        continue;
-      }
-      // Otherwise wait out the cooldown
-      console.warn(`[Orchestrator] ${rid} ${provider.name} cooldown — waiting ${cooldownSec}s...`);
-      await new Promise((r) => setTimeout(r, cooldownSec * 1000));
+      console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_SKIP] provider=${provider.name} reason=cooldown remaining=${cooldownSec}s`);
+      errors.push(`${provider.name}: On cooldown (${cooldownSec}s)`);
+      continue;
     }
 
     const model = provider.defaultModel;
@@ -207,64 +208,57 @@ export async function executeAICompletion(
     };
 
     try {
-      console.log(`[Orchestrator] ${rid} → ${provider.name} model=${model} timeout=${Math.round(perAttemptMs / 1000)}s`);
+      console.log(`[Orchestrator] ${rid}${chunkTag} [AI_ATTEMPT] provider=${provider.name} model=${model} timeout=${Math.round(perAttemptMs / 1000)}s`);
       let response = await doFetch();
-      let latencyMs = Date.now() - startTime;
+      const latencyMs = Date.now() - startTime;
 
-      // --- 429 ---
+      // ── 429 Rate Limited ─────────────────────────────────────────────────
+      // KEY FIX: Do NOT wait. Do NOT retry on the same provider.
+      // Set circuit-breaker cooldown and immediately cascade to next provider.
       if (response.status === 429) {
-        const waitSec = parseGroqRetryAfter(response.headers);
-        const waitMs = waitSec * 1000;
-        const remainingAfterWait = msUntilDeadline(options.deadlineMs) - waitMs;
-
-        if (remainingAfterWait < 8000) {
-          // Not enough time to retry after waiting — fail fast
-          console.warn(
-            `[Orchestrator] ${rid} ${provider.name} 429 — retry-after=${waitSec}s would exceed deadline. Failing fast.`
-          );
-          errors.push(`${provider.name} (${model}): 429 deadline-exceeded`);
-          continue; // try next provider without waiting
-        }
-
-        // Enough time: wait and retry ONCE
+        const cooldown = parseRetryAfterSeconds(response.headers);
         console.warn(
-          `[Orchestrator] ${rid} ${provider.name} 429 — waiting ${waitSec}s then retrying once...`
+          `[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=429 latency=${latencyMs}ms`
         );
-        errors.push(`${provider.name} (${model}): 429 wait=${waitSec}s`);
-        await new Promise((r) => setTimeout(r, waitMs));
-
-        // One retry
-        response = await doFetch();
-        latencyMs = Date.now() - startTime;
-
-        if (response.status === 429) {
-          console.warn(`[Orchestrator] ${rid} ${provider.name} 429 again after retry. Moving to next provider.`);
-          errors.push(`${provider.name} (${model}): 429 repeated`);
-          continue;
-        }
+        console.warn(
+          `[Orchestrator] ${rid}${chunkTag} [AI_FALLBACK] provider=${provider.name} reason=429 cooldown=${cooldown}s → cascading to next provider immediately`
+        );
+        setProviderCooldown(provider.name, cooldown);
+        errors.push(`${provider.name} (${model}): 429 rate-limited → cascading`);
+        continue; // immediately try OpenRouter
       }
 
-      // --- 4xx (not 429) ---
+      // ── 4xx (not 429) ────────────────────────────────────────────────────
       if (response.status >= 400 && response.status < 500) {
         const errText = await response.text().catch(() => '');
-        console.warn(`[Orchestrator] ${rid} ${provider.name} HTTP ${response.status}: ${errText.slice(0, 200)}`);
+        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=${response.status} latency=${latencyMs}ms body=${errText.slice(0, 200)}`);
         errors.push(`${provider.name} (${model}): HTTP ${response.status}`);
-        continue; // try next provider
+        continue;
       }
 
-      // --- 5xx — one retry ---
+      // ── 5xx — one retry after 500ms ──────────────────────────────────────
       if (response.status >= 500) {
         const errText = await response.text().catch(() => '');
-        console.warn(`[Orchestrator] ${rid} ${provider.name} HTTP ${response.status}: ${errText.slice(0, 200)}. Retrying in 500ms...`);
+        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=${response.status} latency=${latencyMs}ms — retrying in 500ms`);
         if (msUntilDeadline(options.deadlineMs) > 5000) {
           await new Promise((r) => setTimeout(r, 500));
-          response = await doFetch();
-          latencyMs = Date.now() - startTime;
+          const retry = await doFetch();
+          if (!retry.ok) {
+            errors.push(`${provider.name} (${model}): HTTP ${retry.status} after 5xx retry`);
+            continue;
+          }
+          const retryJson = await retry.json();
+          const retryContent = retryJson?.choices?.[0]?.message?.content;
+          if (!retryContent || typeof retryContent !== 'string' || retryContent.trim().length === 0) {
+            errors.push(`${provider.name} (${model}): Empty response after 5xx retry`);
+            continue;
+          }
+          const retryLatency = Date.now() - startTime;
+          console.log(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=200 latency=${retryLatency}ms (after 5xx retry)`);
+          return { content: retryContent, providerName: `${provider.name} (${model})`, latencyMs: retryLatency };
         }
-        if (!response.ok) {
-          errors.push(`${provider.name} (${model}): HTTP ${response.status}`);
-          continue;
-        }
+        errors.push(`${provider.name} (${model}): HTTP ${response.status}`);
+        continue;
       }
 
       if (!response.ok) {
@@ -276,12 +270,12 @@ export async function executeAICompletion(
       const content = json?.choices?.[0]?.message?.content;
 
       if (!content || typeof content !== 'string' || content.trim().length === 0) {
-        console.warn(`[Orchestrator] ${rid} ${provider.name} returned empty content.`);
+        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=200 empty_content latency=${latencyMs}ms`);
         errors.push(`${provider.name} (${model}): Empty response`);
         continue;
       }
 
-      console.log(`[Orchestrator] ${rid} SUCCESS: ${provider.name} model=${model} latency=${latencyMs}ms`);
+      console.log(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=200 latency=${latencyMs}ms`);
       return { content, providerName: `${provider.name} (${model})`, latencyMs };
 
     } catch (err: any) {
@@ -289,13 +283,13 @@ export async function executeAICompletion(
       const isAbort = err.name === 'AbortError' || err.message?.includes('aborted');
 
       if (isAbort) {
-        console.warn(`[Orchestrator] ${rid} ${provider.name} (${model}) timed out after ${Math.round(perAttemptMs / 1000)}s.`);
+        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=TIMEOUT latency=${latencyMs}ms timeout=${Math.round(perAttemptMs / 1000)}s`);
         errors.push(`${provider.name} (${model}): Timeout`);
       } else {
-        console.error(`[Orchestrator] ${rid} ${provider.name} (${model}) exception (${latencyMs}ms):`, err.message || err);
+        console.error(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=ERROR latency=${latencyMs}ms error=${err.message || err}`);
         errors.push(`${provider.name} (${model}): ${err.message || 'Network error'}`);
       }
-      continue; // try next provider
+      continue;
     }
   }
 
