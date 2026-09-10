@@ -211,6 +211,14 @@ export function decodeHtmlEntities(text: string): string {
     .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
 }
 
+// Server-side in-memory transcript cache to eliminate redundant Supadata API credits
+interface TranscriptCacheEntry {
+  result: YoutubeFetchResult;
+  timestamp: number;
+}
+const transcriptCache = new Map<string, TranscriptCacheEntry>();
+const inFlightTranscriptPromises = new Map<string, Promise<YoutubeFetchResult>>();
+
 export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchResult> {
   const videoId = extractYoutubeVideoId(url);
   if (!videoId) {
@@ -221,6 +229,36 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
     );
   }
 
+  // 1. Check in-memory cache (TTL: 2 hours)
+  const cached = transcriptCache.get(videoId);
+  if (cached && Date.now() - cached.timestamp < 7200000) {
+    console.log(`[Supadata Transcript Cache] HIT for videoId=${videoId}. Reusing cached transcript (0 Supadata API credits used).`);
+    return cached.result;
+  }
+
+  // 2. Check in-flight promise (Deduplicate simultaneous requests for same video)
+  const existingInFlight = inFlightTranscriptPromises.get(videoId);
+  if (existingInFlight) {
+    console.log(`[Supadata Transcript In-Flight] Joining existing transcript request for videoId=${videoId} (0 extra Supadata API credits used).`);
+    return existingInFlight;
+  }
+
+  // 3. Execute single-flight fetch & cache result
+  const fetchPromise = (async () => {
+    try {
+      const result = await fetchYoutubeTranscriptFromSupadata(videoId, url);
+      transcriptCache.set(videoId, { result, timestamp: Date.now() });
+      return result;
+    } finally {
+      inFlightTranscriptPromises.delete(videoId);
+    }
+  })();
+
+  inFlightTranscriptPromises.set(videoId, fetchPromise);
+  return fetchPromise;
+}
+
+async function fetchYoutubeTranscriptFromSupadata(videoId: string, url: string): Promise<YoutubeFetchResult> {
   const apiKey = process.env.SUPADATA_API_KEY;
   if (!apiKey || !apiKey.trim()) {
     console.error('[Supadata Transcript Error] SUPADATA_API_KEY environment variable is not configured.');
@@ -246,7 +284,7 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
   }
 
   const targetUrl = `https://api.supadata.ai/v1/transcript?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
-  console.log(`[Supadata Transcript] Requesting transcript for videoId=${videoId}`);
+  console.log(`[Supadata Transcript API Call] Requesting transcript from Supadata API for videoId=${videoId}`);
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 25000);
@@ -281,7 +319,7 @@ export async function fetchYoutubeTranscript(url: string): Promise<YoutubeFetchR
     clearTimeout(timeoutId);
   }
 
-  console.log(`[Supadata Transcript] Response status: ${res.status} for videoId=${videoId}`);
+  console.log(`[Supadata Transcript API Response] Response status: ${res.status} for videoId=${videoId}`);
 
   if (res.status === 401 || res.status === 403) {
     console.error(`[Supadata Transcript Error] Authentication or quota error (HTTP ${res.status}) for videoId=${videoId}`);

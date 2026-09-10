@@ -25,14 +25,19 @@ const PROVIDERS: ProviderConfig[] = [
     apiKeyEnv: 'GROQ_API_KEY',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
     defaultModel: 'groq/compound-mini',
-    fallbackModels: ['qwen/qwen3.6-27b', 'groq/compound'],
+    fallbackModels: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'mixtral-8x7b-32768'],
   },
   {
     name: 'OpenRouter',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     defaultModel: 'openrouter/free',
-    fallbackModels: ['google/gemma-4-26b-a4b-it:free', 'nvidia/nemotron-3.5-lightning:free', 'liquid/lfm-2.5-2.6b:free'],
+    fallbackModels: [
+      'google/gemma-2-9b-it:free',
+      'meta-llama/llama-3.3-70b-instruct:free',
+      'mistralai/mistral-7b-instruct:free',
+      'qwen/qwen-2.5-coder-32b-instruct:free',
+    ],
     extraHeaders: {
       'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
       'X-Title': 'KWIP Visual Summary Engine',
@@ -43,9 +48,10 @@ const PROVIDERS: ProviderConfig[] = [
     apiKeyEnv: 'NVIDIA_API_KEY',
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
     defaultModel: 'meta/llama-3.2-11b-vision-instruct',
-    fallbackModels: ['meta/llama-3.2-90b-vision-instruct', 'deepseek-ai/deepseek-v4-flash-0731'],
+    fallbackModels: ['meta/llama-3.2-90b-vision-instruct', 'deepseek-ai/deepseek-r1'],
   },
 ];
+
 
 // Circuit Breaker: Track cooldown timestamp (ms) per provider
 const cooldownUntilMap = new Map<string, number>();
