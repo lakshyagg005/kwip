@@ -49,7 +49,7 @@ const PROVIDERS: ProviderConfig[] = [
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     defaultModel: 'meta-llama/llama-3.3-70b-instruct:free',
     extraHeaders: {
-      'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || process.env.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000',
+      'HTTP-Referer': process.env.NEXT_PUBLIC_APP_URL || process.env.NEXT_PUBLIC_SITE_URL || 'https://kwip-brown.vercel.app/',
       'X-Title': 'KWIP Visual Summary Engine',
     },
   },

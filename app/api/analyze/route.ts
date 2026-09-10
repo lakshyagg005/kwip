@@ -115,6 +115,9 @@ export async function POST(req: NextRequest) {
 
     if (!providers.groq && !providers.openrouter && !providers.nvidia) {
       console.error(`[Analyze API] requestId=${requestId} AI_CONFIG_MISSING – no provider keys are set. Aborting before transcript fetch.`);
+      if (userId && quotaReserved) {
+        await refundQuota(userId);
+      }
       return NextResponse.json(
         {
           error: 'AI service is not configured. Please contact support.',

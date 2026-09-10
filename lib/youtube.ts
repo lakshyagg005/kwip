@@ -283,6 +283,17 @@ async function fetchYoutubeTranscriptFromSupadata(videoId: string, url: string):
     };
   }
 
+  // Pre-check video duration before calling Supadata to save API credits if video > 30 mins
+  const preDuration = await fetchYoutubeVideoDuration(videoId);
+  if (preDuration !== null && preDuration > 1800) {
+    console.warn(`[YouTube Duration Pre-check] videoId=${videoId} preDuration=${preDuration}s > 1800s. Rejecting before Supadata call.`);
+    throw new YoutubeExtractionError(
+      'KWIP currently supports videos up to 30 minutes.',
+      'VIDEO_TOO_LONG',
+      400
+    );
+  }
+
   const targetUrl = `https://api.supadata.ai/v1/transcript?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
   console.log(`[Supadata Transcript API Call] Requesting transcript from Supadata API for videoId=${videoId}`);
 
