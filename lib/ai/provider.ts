@@ -72,24 +72,26 @@ export async function generateAIAnalysis(
   transcript: string,
   metadata: SourceMetadata,
   style: TemplateStyle = 'editorial',
-  formats: OutputFormat[] = ['brief', 'carousel', 'pdf']
+  formats: OutputFormat[] = ['brief', 'carousel', 'pdf'],
+  requestId?: string
 ): Promise<KwipAnalysisResult> {
   const isLongVideo = transcript.length > 18000;
 
   if (isLongVideo) {
-    console.log(`[AI Pipeline] Video "${metadata.videoTitle}" transcript is ${transcript.length} chars. Executing Long-Video Hierarchical Chunk + Synthesize pipeline.`);
-    return generateLongVideoAnalysis(transcript, metadata, style, formats);
+    console.log(`[AI Pipeline] [${requestId ?? '-'}] Video "${metadata.videoTitle}" transcript is ${transcript.length} chars. Executing Long-Video pipeline.`);
+    return generateLongVideoAnalysis(transcript, metadata, style, formats, requestId);
   }
 
   // Short/medium video direct pipeline
-  return generateDirectAIAnalysis(transcript, metadata, style, formats);
+  return generateDirectAIAnalysis(transcript, metadata, style, formats, requestId);
 }
 
 async function generateDirectAIAnalysis(
   transcript: string,
   metadata: SourceMetadata,
   style: TemplateStyle,
-  formats: OutputFormat[]
+  formats: OutputFormat[],
+  requestId?: string
 ): Promise<KwipAnalysisResult> {
   const preparedText = prepareTranscriptText(transcript, 18000);
 
@@ -162,6 +164,7 @@ ${preparedText}`;
     ],
     temperature: 0.2,
     max_tokens: 3000,
+    requestId,
   });
 
   let cleanedJson = sanitizeJsonString(completion.content);
@@ -170,14 +173,14 @@ ${preparedText}`;
   try {
     parsedData = JSON.parse(cleanedJson);
   } catch (parseError) {
-    console.error(`Failed to parse JSON from AI model (${completion.providerName}):`, parseError);
+    console.error(`[${requestId ?? '-'}] Failed to parse JSON from AI model (${completion.providerName}):`, parseError);
     parsedData = {};
   }
 
   let valCheck = validateAnalysisResult(parsedData);
 
   if (!valCheck.valid) {
-    console.warn(`[Validator] Initial output failed validation (${valCheck.reason}). Retrying with targeted prompt...`);
+    console.warn(`[${requestId ?? '-'}] [Validator] Initial output failed validation (${valCheck.reason}). Retrying with targeted prompt...`);
 
     const retryPrompt = `${userPrompt}
 
@@ -197,18 +200,23 @@ Please re-analyze the transcript and ensure:
         ],
         temperature: 0.2,
         max_tokens: 3000,
+        requestId,
       });
 
       cleanedJson = sanitizeJsonString(completion.content);
-      const retryParsed = JSON.parse(cleanedJson);
-      const retryValCheck = validateAnalysisResult(retryParsed);
+      try {
+        const retryParsed = JSON.parse(cleanedJson);
+        const retryValCheck = validateAnalysisResult(retryParsed);
 
-      if (retryValCheck.valid) {
-        parsedData = retryParsed;
-        valCheck = retryValCheck;
+        if (retryValCheck.valid) {
+          parsedData = retryParsed;
+          valCheck = retryValCheck;
+        }
+      } catch (retryParseErr) {
+        console.warn(`[${requestId ?? '-'}] [Validator] Retry JSON parse failed:`, retryParseErr);
       }
     } catch (retryErr) {
-      console.warn('[Validator] Retry completion failed:', retryErr);
+      console.warn(`[${requestId ?? '-'}] [Validator] Retry completion failed:`, retryErr);
     }
   }
 
@@ -241,7 +249,8 @@ async function generateLongVideoAnalysis(
   transcript: string,
   metadata: SourceMetadata,
   style: TemplateStyle,
-  formats: OutputFormat[]
+  formats: OutputFormat[],
+  requestId?: string
 ): Promise<KwipAnalysisResult> {
   const durationSec = normalizeDurationToSeconds(metadata.duration) ?? 0;
   const chunks = splitTranscriptIntoChunks(transcript, {
@@ -260,22 +269,17 @@ async function generateLongVideoAnalysis(
   });
   console.log(`====================================================\n`);
 
-  // 1. Analyze Chunks Concurrently with Controlled Concurrency (Limit = 2) & Pacing Delay
+  // 1. Analyze chunks SEQUENTIALLY with 600ms inter-chunk delay to prevent Groq RPM bursts.
+  // Concurrency = 1: one chunk at a time.
   const chunkResults: ChunkAnalysisResult[] = [];
-  const concurrencyLimit = 2;
 
-  for (let i = 0; i < chunks.length; i += concurrencyLimit) {
-    const chunkBatch = chunks.slice(i, i + concurrencyLimit);
-    const batchPromises = chunkBatch.map((chunk) => analyzeSingleChunk(chunk, metadata));
-    const batchResults = await Promise.all(batchPromises);
+  for (let i = 0; i < chunks.length; i++) {
+    const result = await analyzeSingleChunk(chunks[i], metadata, requestId);
+    if (result) chunkResults.push(result);
 
-    batchResults.forEach((res) => {
-      if (res) chunkResults.push(res);
-    });
-
-    // Pacing delay (400ms) between batches to prevent HTTP 429 rate limit storms
-    if (i + concurrencyLimit < chunks.length) {
-      await new Promise((res) => setTimeout(res, 400));
+    // Pacing delay between chunks (skip after the last one)
+    if (i < chunks.length - 1) {
+      await new Promise((res) => setTimeout(res, 600));
     }
   }
 
@@ -304,8 +308,8 @@ async function generateLongVideoAnalysis(
   console.log(`🔍 [TRACE 9] CHUNK COVERAGE SUMMARY: ${chunkResults.map((c) => `Sec ${c.sectionIndex} (${c.timeRangeLabel || 'N/A'}): ${c.keyIdeas.length} ideas`).join(' | ')}`);
 
   // 2. Perform Final Synthesis Pass over all merged chunk findings (Beginning, Middle, and End)
-  console.log(`[Long-Video Pipeline] Synthesis pass for ${chunkResults.length}/${chunks.length} completed chunks...`);
-  const synthesizedData = await synthesizeChunkResults(chunkResults, metadata);
+  console.log(`[Long-Video Pipeline] [${requestId ?? '-'}] Synthesis pass for ${chunkResults.length}/${chunks.length} completed chunks...`);
+  const synthesizedData = await synthesizeChunkResults(chunkResults, metadata, requestId);
 
   const sanitizedData = sanitizeAndRepairParsedData(synthesizedData, metadata.videoTitle);
 
@@ -363,7 +367,8 @@ function parseLooseChunkJson(text: string): any {
 
 async function analyzeSingleChunk(
   chunk: TranscriptChunk,
-  metadata: SourceMetadata
+  metadata: SourceMetadata,
+  requestId?: string
 ): Promise<ChunkAnalysisResult | null> {
   const systemPrompt = `You are KWIP Section Analyzer.
 Analyze section ${chunk.index} of ${chunk.totalChunks} (${chunk.timeRangeLabel || chunk.sectionLabel}) of a YouTube video transcript.
@@ -413,6 +418,7 @@ ${chunk.text}`;
       ],
       temperature: 0.2,
       max_tokens: 1800,
+      requestId,
     });
 
     const cleaned = sanitizeJsonString(completion.content);
@@ -421,7 +427,7 @@ ${chunk.text}`;
     try {
       parsed = JSON.parse(cleaned);
     } catch (parseErr) {
-      console.warn(`[Chunk Analyzer] JSON.parse error on section ${chunk.index}, attempting loose regex repair...`);
+      console.warn(`[${requestId ?? '-'}] [Chunk Analyzer] JSON.parse error on section ${chunk.index}, attempting loose regex repair...`);
       parsed = parseLooseChunkJson(cleaned);
     }
 
@@ -436,14 +442,15 @@ ${chunk.text}`;
       actionSteps: Array.isArray(parsed.actionSteps) ? parsed.actionSteps : [],
     };
   } catch (err) {
-    console.warn(`[Chunk Analyzer] Section ${chunk.index}/${chunk.totalChunks} failed completely:`, err);
+    console.warn(`[${requestId ?? '-'}] [Chunk Analyzer] Section ${chunk.index}/${chunk.totalChunks} failed:`, err);
     return null;
   }
 }
 
 async function synthesizeChunkResults(
   chunkResults: ChunkAnalysisResult[],
-  metadata: SourceMetadata
+  metadata: SourceMetadata,
+  requestId?: string
 ): Promise<any> {
   // Format section summaries and findings across Beginning, Middle, and End of video
   const mergedSectionDetails = chunkResults
@@ -524,6 +531,7 @@ ${mergedSectionDetails}`;
       ],
       temperature: 0.2,
       max_tokens: 4096,
+      requestId,
     });
 
     console.log(`🔍 [TRACE 11] FINAL SYNTHESIS OUTPUT LENGTH: ${completion.content.length} chars (~${Math.round(completion.content.length / 4)} tokens) | Model: ${completion.providerName}`);

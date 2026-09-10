@@ -143,7 +143,8 @@ export async function POST(req: NextRequest) {
         youtubeData.rawTranscript,
         youtubeData.metadata,
         style,
-        formats
+        formats,
+        requestId
       );
     });
 
