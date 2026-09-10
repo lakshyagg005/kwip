@@ -73,17 +73,18 @@ export async function generateAIAnalysis(
   metadata: SourceMetadata,
   style: TemplateStyle = 'editorial',
   formats: OutputFormat[] = ['brief', 'carousel', 'pdf'],
-  requestId?: string
+  requestId?: string,
+  deadlineMs?: number
 ): Promise<KwipAnalysisResult> {
   const isLongVideo = transcript.length > 18000;
 
   if (isLongVideo) {
-    console.log(`[AI Pipeline] [${requestId ?? '-'}] Video "${metadata.videoTitle}" transcript is ${transcript.length} chars. Executing Long-Video pipeline.`);
-    return generateLongVideoAnalysis(transcript, metadata, style, formats, requestId);
+    console.log(`[AI Pipeline] [${requestId ?? '-'}] Transcript ${transcript.length} chars → Long-Video pipeline.`);
+    return generateLongVideoAnalysis(transcript, metadata, style, formats, requestId, deadlineMs);
   }
 
-  // Short/medium video direct pipeline
-  return generateDirectAIAnalysis(transcript, metadata, style, formats, requestId);
+  console.log(`[AI Pipeline] [${requestId ?? '-'}] Transcript ${transcript.length} chars → Direct pipeline.`);
+  return generateDirectAIAnalysis(transcript, metadata, style, formats, requestId, deadlineMs);
 }
 
 async function generateDirectAIAnalysis(
@@ -91,7 +92,8 @@ async function generateDirectAIAnalysis(
   metadata: SourceMetadata,
   style: TemplateStyle,
   formats: OutputFormat[],
-  requestId?: string
+  requestId?: string,
+  deadlineMs?: number
 ): Promise<KwipAnalysisResult> {
   const preparedText = prepareTranscriptText(transcript, 18000);
 
@@ -163,8 +165,10 @@ ${preparedText}`;
       { role: 'user', content: userPrompt },
     ],
     temperature: 0.2,
-    max_tokens: 3000,
+    // Direct analysis: schema output is ~1200–1800 tokens; cap at 2400 for safety
+    max_tokens: 2400,
     requestId,
+    deadlineMs,
   });
 
   let cleanedJson = sanitizeJsonString(completion.content);
@@ -199,8 +203,9 @@ Please re-analyze the transcript and ensure:
           { role: 'user', content: retryPrompt },
         ],
         temperature: 0.2,
-        max_tokens: 3000,
+        max_tokens: 2400,
         requestId,
+        deadlineMs,
       });
 
       cleanedJson = sanitizeJsonString(completion.content);
@@ -242,15 +247,13 @@ Please re-analyze the transcript and ensure:
   };
 }
 
-/**
- * Long-Video Analysis Pipeline: Chunk -> Analyze Each Chunk -> Merge & Synthesize Entire Video
- */
 async function generateLongVideoAnalysis(
   transcript: string,
   metadata: SourceMetadata,
   style: TemplateStyle,
   formats: OutputFormat[],
-  requestId?: string
+  requestId?: string,
+  deadlineMs?: number
 ): Promise<KwipAnalysisResult> {
   const durationSec = normalizeDurationToSeconds(metadata.duration) ?? 0;
   const chunks = splitTranscriptIntoChunks(transcript, {
@@ -259,57 +262,40 @@ async function generateLongVideoAnalysis(
     totalDurationSeconds: durationSec,
   });
 
-  console.log(`\n====================================================`);
-  console.log(`🔍 [TRACE 1] RAW TRANSCRIPT CHAR COUNT: ${transcript.length} chars`);
-  console.log(`🔍 [TRACE 2] RAW TRANSCRIPT APPROX TOKEN COUNT: ~${Math.round(transcript.length / 4)} tokens`);
-  console.log(`🔍 [TRACE 3] ESTIMATED TRANSCRIPT SENTENCE SEGMENTS: ${transcript.split(/(?<=[.!?])\s+/).length}`);
-  console.log(`🔍 [TRACE 4] NUMBER OF GENERATED CHUNKS: ${chunks.length}`);
-  chunks.forEach((c) => {
-    console.log(`🔍 [TRACE 5&6] Chunk #${c.index}/${c.totalChunks}: ${c.charCount} chars (~${Math.round(c.charCount / 4)} tokens) | Time Range: ${c.timeRangeLabel || 'N/A'}`);
-  });
-  console.log(`====================================================\n`);
+  console.log(`[Long-Video] [${requestId ?? '-'}] ${chunks.length} chunks | deadline=${deadlineMs ? new Date(deadlineMs).toISOString() : 'none'}`);
 
-  // 1. Analyze chunks SEQUENTIALLY with 600ms inter-chunk delay to prevent Groq RPM bursts.
-  // Concurrency = 1: one chunk at a time.
   const chunkResults: ChunkAnalysisResult[] = [];
+  const MIN_REMAINING_FOR_CHUNK_MS = 30_000;
 
   for (let i = 0; i < chunks.length; i++) {
-    const result = await analyzeSingleChunk(chunks[i], metadata, requestId);
-    if (result) chunkResults.push(result);
+    const remainingMs = deadlineMs ? deadlineMs - Date.now() : Infinity;
+    if (remainingMs < MIN_REMAINING_FOR_CHUNK_MS) {
+      console.warn(`[Long-Video] [${requestId ?? '-'}] Deadline near (${Math.round(remainingMs / 1000)}s left). Stopping at chunk ${i + 1}/${chunks.length}.`);
+      break;
+    }
 
-    // Pacing delay between chunks (skip after the last one)
-    if (i < chunks.length - 1) {
+    console.log(`[Long-Video] [${requestId ?? '-'}] chunk ${i + 1}/${chunks.length} start remaining=${Math.round(remainingMs / 1000)}s`);
+    const result = await analyzeSingleChunk(chunks[i], metadata, requestId, deadlineMs);
+    if (result) chunkResults.push(result);
+    console.log(`[Long-Video] [${requestId ?? '-'}] chunk ${i + 1}/${chunks.length} ${result ? 'ok' : 'failed'}`);
+
+    if (i < chunks.length - 1 && (deadlineMs ? deadlineMs - Date.now() : Infinity) > MIN_REMAINING_FOR_CHUNK_MS) {
       await new Promise((res) => setTimeout(res, 600));
     }
   }
 
   const successfulCount = chunkResults.length;
   const failedCount = chunks.length - successfulCount;
+  console.log(`[Long-Video] [${requestId ?? '-'}] chunks: ${successfulCount} ok / ${failedCount} failed / ${chunks.length} total`);
 
-  console.log(`\n====================================================`);
-  console.log(`🔍 [TRACE 7] SUCCESSFUL CHUNK ANALYSES: ${successfulCount}/${chunks.length}`);
-  console.log(`🔍 [TRACE 8] FAILED CHUNK ANALYSES: ${failedCount}/${chunks.length}`);
-
-  // Verify that at least 70% of chunk analyses succeeded
   if (successfulCount < Math.ceil(chunks.length * 0.7)) {
-    console.error(`[Long-Video Pipeline] Only ${successfulCount}/${chunks.length} chunks succeeded (<70%). Aborting analysis to prevent incomplete output.`);
-    throw new Error('ANALYSIS_INCOMPLETE: Unable to analyze enough sections of this video due to API rate limits or network issues. Please try again in a few moments.');
+    console.error(`[Long-Video] [${requestId ?? '-'}] Only ${successfulCount}/${chunks.length} chunks succeeded (<70%). Aborting.`);
+    throw new Error('ANALYSIS_INCOMPLETE: Unable to analyze enough sections.');
   }
 
-  let partialAnalysisWarning: string | undefined = undefined;
-  if (successfulCount < chunks.length) {
-    partialAnalysisWarning = `Note: ${failedCount} section(s) could not be fully analyzed due to temporary rate limits, but the remaining ${successfulCount} sections were successfully processed and synthesized.`;
-    console.warn(`[Long-Video Pipeline] ${partialAnalysisWarning}`);
-  }
-
-  // Sort chunk results by section index to guarantee sequential order and prevent overwriting
   chunkResults.sort((a, b) => a.sectionIndex - b.sectionIndex);
-
-  console.log(`🔍 [TRACE 9] CHUNK COVERAGE SUMMARY: ${chunkResults.map((c) => `Sec ${c.sectionIndex} (${c.timeRangeLabel || 'N/A'}): ${c.keyIdeas.length} ideas`).join(' | ')}`);
-
-  // 2. Perform Final Synthesis Pass over all merged chunk findings (Beginning, Middle, and End)
-  console.log(`[Long-Video Pipeline] [${requestId ?? '-'}] Synthesis pass for ${chunkResults.length}/${chunks.length} completed chunks...`);
-  const synthesizedData = await synthesizeChunkResults(chunkResults, metadata, requestId);
+  console.log(`[Long-Video] [${requestId ?? '-'}] Starting synthesis pass...`);
+  const synthesizedData = await synthesizeChunkResults(chunkResults, metadata, requestId, deadlineMs);
 
   const sanitizedData = sanitizeAndRepairParsedData(synthesizedData, metadata.videoTitle);
 
@@ -330,7 +316,6 @@ async function generateLongVideoAnalysis(
     style,
     selectedFormats: formats,
     isPublic: false,
-    partialAnalysisWarning,
   };
 }
 
@@ -338,7 +323,6 @@ function parseLooseChunkJson(text: string): any {
   const summaryMatch = text.match(/"summary"\s*:\s*"([^"]+)"/i) || text.match(/"summary"\s*:\s*"([\s\S]*?)"\s*,/i);
   const summary = summaryMatch ? summaryMatch[1].trim() : 'Section overview from source video.';
 
-  // Extract key ideas using regex pattern matching
   const keyIdeas: KeyIdea[] = [];
   const ideaRegex = /"title"\s*:\s*"([^"]+)"[\s\S]*?"summary"\s*:\s*"([^"]+)"/gi;
   let match: RegExpExecArray | null;
@@ -368,47 +352,15 @@ function parseLooseChunkJson(text: string): any {
 async function analyzeSingleChunk(
   chunk: TranscriptChunk,
   metadata: SourceMetadata,
-  requestId?: string
+  requestId?: string,
+  deadlineMs?: number
 ): Promise<ChunkAnalysisResult | null> {
-  const systemPrompt = `You are KWIP Section Analyzer.
-Analyze section ${chunk.index} of ${chunk.totalChunks} (${chunk.timeRangeLabel || chunk.sectionLabel}) of a YouTube video transcript.
-Extract key insights, core ideas, facts/statistics, verbatim quotes, and actionable steps ONLY from this section text.
+  const systemPrompt = `You are KWIP Section Analyzer. Analyze section ${chunk.index} of ${chunk.totalChunks} (${chunk.timeRangeLabel || chunk.sectionLabel}) of a YouTube video transcript. Extract ONLY facts present in the text. Output strict valid JSON (no markdown).
 
-CRITICAL INSTRUCTIONS:
-1. OUTPUT FORMAT: Strict valid JSON without markdown formatting (\`\`\`json).
-2. NO HALLUCINATION: Only extract facts, claims, metrics, or verbatim quotes present in THIS section.
-3. If no statistics exist in this section, return empty array [].
-4. If no verbatim quotes exist in this section, return empty array [].
+SCHEMA: {"summary":"1-2 sentences","keyIdeas":[{"number":1,"title":"","summary":"","explanation":"","example":"","tag":""}],"statistics":[{"value":"","label":"","context":""}],"quotes":[{"text":"","speaker":"","context":""}],"actionSteps":[{"stepNumber":1,"action":"","impact":""}]}
 
-JSON SCHEMA:
-{
-  "summary": "1-2 complete sentences summarizing what is discussed in this section",
-  "keyIdeas": [
-    {
-      "number": 1,
-      "title": "Distinct Actionable Concept Title",
-      "summary": "Core concept explanation from this section",
-      "explanation": "Deeper context or principle from this section",
-      "example": "Metric or real example mentioned (if any)",
-      "tag": "Concept tag"
-    }
-  ],
-  "statistics": [
-    { "value": "Stat or %", "label": "Short label", "context": "Context from section" }
-  ],
-  "quotes": [
-    { "text": "Verbatim quote", "speaker": "Speaker name if known", "context": "Context" }
-  ],
-  "actionSteps": [
-    { "stepNumber": 1, "action": "Takeaway action from this section", "impact": "Outcome" }
-  ]
-}`;
-
-  const userPrompt = `VIDEO TITLE: "${metadata.videoTitle}"
-SECTION: ${chunk.sectionLabel} ${chunk.timeRangeLabel ? `(${chunk.timeRangeLabel})` : ''}
-
-TRANSCRIPT SECTION TEXT:
-${chunk.text}`;
+Rules: No hallucination. If no stats/quotes exist, return []. Do NOT explain your reasoning.`;
+  const userPrompt = `VIDEO TITLE: "${metadata.videoTitle}"\nTRANSCRIPT SECTION:\n${chunk.text}`;
 
   try {
     const completion = await executeAICompletion({
@@ -417,17 +369,16 @@ ${chunk.text}`;
         { role: 'user', content: userPrompt },
       ],
       temperature: 0.2,
-      max_tokens: 1800,
+      max_tokens: 1500,
       requestId,
+      deadlineMs,
     });
 
     const cleaned = sanitizeJsonString(completion.content);
     let parsed: any;
-
     try {
       parsed = JSON.parse(cleaned);
     } catch (parseErr) {
-      console.warn(`[${requestId ?? '-'}] [Chunk Analyzer] JSON.parse error on section ${chunk.index}, attempting loose regex repair...`);
       parsed = parseLooseChunkJson(cleaned);
     }
 
@@ -442,7 +393,6 @@ ${chunk.text}`;
       actionSteps: Array.isArray(parsed.actionSteps) ? parsed.actionSteps : [],
     };
   } catch (err) {
-    console.warn(`[${requestId ?? '-'}] [Chunk Analyzer] Section ${chunk.index}/${chunk.totalChunks} failed:`, err);
     return null;
   }
 }
@@ -450,78 +400,27 @@ ${chunk.text}`;
 async function synthesizeChunkResults(
   chunkResults: ChunkAnalysisResult[],
   metadata: SourceMetadata,
-  requestId?: string
+  requestId?: string,
+  deadlineMs?: number
 ): Promise<any> {
-  // Format section summaries and findings across Beginning, Middle, and End of video
   const mergedSectionDetails = chunkResults
     .map(
       (c) =>
         `--- SECTION ${c.sectionIndex} ${c.timeRangeLabel ? `(${c.timeRangeLabel})` : ''} ---
-Section Summary: ${c.summary}
-Section Key Ideas (${c.keyIdeas.length}):
-${JSON.stringify(c.keyIdeas, null, 2)}
-Section Stats: ${JSON.stringify(c.statistics)}
-Section Quotes: ${JSON.stringify(c.quotes)}
-Section Actions: ${JSON.stringify(c.actionSteps)}`
+Summary: ${c.summary}
+Key Ideas: ${JSON.stringify(c.keyIdeas)}
+Stats: ${JSON.stringify(c.statistics)}
+Quotes: ${JSON.stringify(c.quotes)}
+Actions: ${JSON.stringify(c.actionSteps)}`
     )
     .join('\n\n');
 
-  const systemPrompt = `You are KWIP Master Synthesizer.
-You are given section-by-section analysis findings from a long YouTube video ("${metadata.videoTitle}").
-Your task is to merge, deduplicate, rank, and synthesize these findings into a unified, executive-grade analysis of the ENTIRE video.
-
-CRITICAL SYNTHESIS REQUIREMENTS:
-1. Output strictly valid JSON matching the exact schema below. No markdown wrappers (\`\`\`json).
-2. MULTI-SECTION COVERAGE: Ensure the key ideas represent the ENTIRE video arc (Beginning, Middle, and End). Do NOT focus only on the opening section.
-3. Produce 2 to 12 distinct, high-impact Key Ideas depending on actual video depth. Deduplicate overlapping ideas from adjacent sections.
-4. Core Thesis ("hook"): State the central argument or main lesson of the video in 1–2 sentences. Do NOT repeat, paraphrase, or mention the video title.
-5. Executive Summary ("executiveSummary"): Synthesize what the speaker actually teaches/argues in 2–4 sentences. Do NOT begin with "This video...", "An in-depth synthesis of...", or simply restate the title.
-6. Statistics & Quotes: Select up to 4 genuine statistics and up to 3 verbatim quotes ONLY if present in the section data. If none exist, return empty arrays [].
-7. Action Steps: Select 3 to 5 clear actionable takeaways derived from the video recommendations.
-8. Final Synthesis ("finalTakeaway"): Single memorable concluding takeaway sentence synthesizing actual content. Do NOT repeat the title or generic boilerplate.
+  const systemPrompt = `You are KWIP Master Synthesizer. Merge section findings into one unified analysis. Output strict valid JSON.
 
 JSON SCHEMA:
-{
-  "contentType": "educational" | "podcast" | "tutorial" | "business" | "documentary",
-  "title": "A sharp, compelling title reflecting full video content (max 10 words)",
-  "hook": "Single powerful sentence stating the central thesis of the video",
-  "executiveSummary": "Concise 2-4 sentence overview synthesizing the entire video discussion",
-  "keyIdeas": [
-    {
-      "number": 1,
-      "title": "Action-Oriented Title",
-      "summary": "1-2 complete sentences core concept explanation",
-      "explanation": "2-3 complete sentences deeper principle or takeaway",
-      "example": "Real example or metric if present",
-      "tag": "Concept Tag"
-    }
-  ],
-  "framework": {
-    "title": "Framework Title (if present across sections, else omit)",
-    "subtitle": "Subtitle",
-    "steps": [
-      { "stepNumber": 1, "title": "Step Name", "description": "Description" }
-    ]
-  },
-  "statistics": [
-    { "value": "Stat", "label": "Label", "context": "Context" }
-  ],
-  "quotes": [
-    { "text": "Quote", "speaker": "Speaker", "context": "Context" }
-  ],
-  "actionSteps": [
-    { "stepNumber": 1, "action": "Actionable takeaway", "impact": "Impact" }
-  ],
-  "finalTakeaway": "One memorable lingering concluding takeaway sentence."
-}`;
+{"contentType":"educational|podcast|tutorial|business|documentary","title":"max 10 words","hook":"1-2 sentences","executiveSummary":"2-4 sentences","keyIdeas":[{"number":1,"title":"","summary":"","explanation":"","example":"","tag":""}],"framework":{"title":"","subtitle":"","steps":[{"stepNumber":1,"title":"","description":""}]},"statistics":[{"value":"","label":"","context":""}],"quotes":[{"text":"","speaker":"","context":""}],"actionSteps":[{"stepNumber":1,"action":"","impact":""}],"finalTakeaway":""}`;
 
-  console.log(`🔍 [TRACE 10] FINAL SYNTHESIS INPUT SIZE: ${mergedSectionDetails.length} chars (~${Math.round(mergedSectionDetails.length / 4)} tokens)`);
-
-  const userPrompt = `VIDEO TITLE: "${metadata.videoTitle}"
-CHANNEL: "${metadata.channelTitle}"
-
-SECTION-BY-SECTION ANALYSIS FINDINGS (${chunkResults.length} SECTIONS COVERED):
-${mergedSectionDetails}`;
+  const userPrompt = `VIDEO: "${metadata.videoTitle}" by ${metadata.channelTitle}\n\nSECTION FINDINGS:\n${mergedSectionDetails}`;
 
   try {
     const completion = await executeAICompletion({
@@ -530,50 +429,52 @@ ${mergedSectionDetails}`;
         { role: 'user', content: userPrompt },
       ],
       temperature: 0.2,
-      max_tokens: 4096,
+      // Synthesis schema output is ~1500–2500 tokens; cap at 3200 for safety
+      max_tokens: 3200,
       requestId,
+      deadlineMs,
     });
 
-    console.log(`🔍 [TRACE 11] FINAL SYNTHESIS OUTPUT LENGTH: ${completion.content.length} chars (~${Math.round(completion.content.length / 4)} tokens) | Model: ${completion.providerName}`);
     const cleaned = sanitizeJsonString(completion.content);
-    const parsed = JSON.parse(cleaned);
-
-    console.log(`🔍 [TRACE 12] FINAL STRUCTURED OBJECT CREATED: Title="${parsed.title}", Key Ideas=${parsed.keyIdeas?.length || 0}, Stats=${parsed.statistics?.length || 0}, Quotes=${parsed.quotes?.length || 0}`);
-    return parsed;
+    try {
+      const parsed = JSON.parse(cleaned);
+      console.log(`[Synthesizer] [${requestId ?? '-'}] SUCCESS: title="${parsed.title}" keyIdeas=${parsed.keyIdeas?.length ?? 0}`);
+      return parsed;
+    } catch (parseErr) {
+      console.warn(`[Synthesizer] [${requestId ?? '-'}] JSON parse failed, using local fallback.`);
+    }
   } catch (err) {
-    console.warn('[Synthesizer] AI synthesis pass failed, building deduplicated local synthesis:', err);
-
-    const mergedKeyIdeas = chunkResults.flatMap((c) => c.keyIdeas);
-    const mergedStats = chunkResults.flatMap((c) => c.statistics);
-    const mergedQuotes = chunkResults.flatMap((c) => c.quotes);
-    const mergedActions = chunkResults.flatMap((c) => c.actionSteps);
-
-    const deduplicatedIdeas = mergedKeyIdeas.slice(0, 10).map((idea, idx) => ({
-      number: idx + 1,
-      title: idea.title || `Core Insight ${idx + 1}`,
-      summary: idea.summary || idea.explanation || 'Key takeaway from video section.',
-      explanation: idea.explanation || idea.summary || 'Detailed insight from video discussion.',
-      example: idea.example,
-      tag: idea.tag || 'Insight',
-    }));
-
-    const fallbackHook = deduplicatedIdeas[0]?.summary || 'Core insight and central lesson from source material.';
-    const fallbackExecSummary = deduplicatedIdeas.slice(0, 3).map((i) => i.summary).join(' ') || 'Comprehensive synthesis of principles discussed across sections.';
-    const fallbackFinalTakeaway = mergedActions[0]?.action || deduplicatedIdeas[deduplicatedIdeas.length - 1]?.summary || 'Primary practical recommendation from source analysis.';
-
-    return {
-      contentType: 'educational',
-      title: metadata.videoTitle,
-      hook: fallbackHook,
-      executiveSummary: fallbackExecSummary,
-      keyIdeas: deduplicatedIdeas,
-      statistics: mergedStats.slice(0, 4),
-      quotes: mergedQuotes.slice(0, 3),
-      actionSteps: mergedActions.slice(0, 4),
-      finalTakeaway: fallbackFinalTakeaway,
-    };
+    console.warn(`[Synthesizer] [${requestId ?? '-'}] AI call failed, using local fallback:`, err);
   }
+
+  // Local fallback — merge chunk results without AI
+  const mergedKeyIdeas = chunkResults.flatMap((c) => c.keyIdeas);
+  const mergedStats = chunkResults.flatMap((c) => c.statistics);
+  const mergedQuotes = chunkResults.flatMap((c) => c.quotes);
+  const mergedActions = chunkResults.flatMap((c) => c.actionSteps);
+
+  const deduplicatedIdeas = mergedKeyIdeas.slice(0, 10).map((idea, idx) => ({
+    number: idx + 1,
+    title: idea.title || `Core Insight ${idx + 1}`,
+    summary: idea.summary || idea.explanation || 'Key takeaway from video section.',
+    explanation: idea.explanation || idea.summary || 'Detailed insight from video discussion.',
+    example: idea.example,
+    tag: idea.tag || 'Insight',
+  }));
+
+  return {
+    contentType: 'educational',
+    title: metadata.videoTitle,
+    hook: deduplicatedIdeas[0]?.summary || 'Core insight from source material.',
+    executiveSummary: deduplicatedIdeas.slice(0, 3).map((i) => i.summary).join(' ') || 'Synthesis of key ideas from this video.',
+    keyIdeas: deduplicatedIdeas,
+    statistics: mergedStats.slice(0, 4),
+    quotes: mergedQuotes.slice(0, 3),
+    actionSteps: mergedActions.slice(0, 4),
+    finalTakeaway: mergedActions[0]?.action || deduplicatedIdeas[deduplicatedIdeas.length - 1]?.summary || 'Primary recommendation from source analysis.',
+  };
 }
+
 
 export function prepareTranscriptText(transcript: string, maxChars = 18000): string {
   if (transcript.length <= maxChars) {

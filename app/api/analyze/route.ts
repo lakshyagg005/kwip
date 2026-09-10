@@ -18,8 +18,13 @@ function getConfiguredProviders(): { groq: boolean; openrouter: boolean; nvidia:
 
 export async function POST(req: NextRequest) {
   const requestId = Math.random().toString(36).slice(2, 10).toUpperCase();
+  // Hard deadline: 240s — safely below Vercel's 300s timeout.
+  // All AI calls check this before starting or sleeping.
+  const ANALYSIS_DEADLINE_MS = Date.now() + 240_000;
   let userId: string | null = null;
   let quotaReserved = false;
+
+  console.log(`[Analyze API] requestId=${requestId} started deadline=${new Date(ANALYSIS_DEADLINE_MS).toISOString()}`);
 
   try {
     // 1. Authenticate User via Supabase Server Client
@@ -144,7 +149,8 @@ export async function POST(req: NextRequest) {
         youtubeData.metadata,
         style,
         formats,
-        requestId
+        requestId,
+        ANALYSIS_DEADLINE_MS
       );
     });
 
@@ -185,6 +191,10 @@ export async function POST(req: NextRequest) {
       statusCode = 503;
       errorCode = 'AI_CONFIG_MISSING';
       userFriendlyMessage = 'AI service is not configured. Please contact support.';
+    } else if (error.message?.includes('ANALYSIS_INCOMPLETE') || error.message?.includes('ANALYSIS_DEADLINE_EXCEEDED')) {
+      statusCode = 503;
+      errorCode = 'ANALYSIS_INCOMPLETE';
+      userFriendlyMessage = 'Unable to analyze enough sections of this video due to temporary rate limits. Please try again in a few moments.';
     } else if (error.message?.includes('AI_ALL_PROVIDERS_FAILED')) {
       statusCode = 503;
       errorCode = 'AI_ALL_PROVIDERS_FAILED';
