@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, Suspense } from 'react';
+import React, { useState, useEffect, useCallback, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { HeaderNav } from '@/components/dashboard/HeaderNav';
@@ -44,10 +44,15 @@ function DashboardContent() {
   const [style, setStyle] = useState<TemplateStyle>('editorial');
   const [selectedFormats, setSelectedFormats] = useState<OutputFormat[]>(['brief', 'carousel', 'pdf']);
   const [isLoading, setIsLoading] = useState(false);
+  const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const [errorInfo, setErrorInfo] = useState<{ message: string; code?: string } | null>(null);
   const [resultData, setResultData] = useState<KwipAnalysisResult | null>(null);
   const [activeResultTab, setActiveResultTab] = useState<OutputFormat>('brief');
   const [copiedLink, setCopiedLink] = useState(false);
+
+  // Stable references to prevent duplicate requests across re-renders and React Strict Mode
+  const activeRequestIdRef = useRef<string | null>(null);
+  const autoAnalyzedUrlRef = useRef<string | null>(null);
 
   // 1. Authenticate user & load profile/usage
   useEffect(() => {
@@ -91,18 +96,29 @@ function DashboardContent() {
   }, [supabase, router, initialUrl]);
 
   const handleAnalyze = useCallback(async (urlToProcess: string) => {
-    if (!urlToProcess.trim()) {
+    const trimmedUrl = urlToProcess.trim();
+    if (!trimmedUrl) {
       setErrorInfo({ message: 'Please enter a valid YouTube URL.', code: 'INVALID_YOUTUBE_URL' });
       return;
     }
 
-    if (!isValidYoutubeUrl(urlToProcess)) {
+    if (!isValidYoutubeUrl(trimmedUrl)) {
       setErrorInfo({
         message: 'That doesn\'t look like a valid YouTube link (e.g. youtube.com/watch?v=... or youtu.be/...)',
         code: 'INVALID_YOUTUBE_URL',
       });
       return;
     }
+
+    // PREVENT DUPLICATE REQUESTS IF AN ANALYSIS IS ALREADY IN PROGRESS
+    if (activeRequestIdRef.current !== null) {
+      console.warn('[Analyze API] Request already in progress, ignoring duplicate trigger.');
+      return;
+    }
+
+    const newRequestId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+    activeRequestIdRef.current = newRequestId;
+    setActiveRequestId(newRequestId);
 
     setIsLoading(true);
     setErrorInfo(null);
@@ -124,7 +140,7 @@ function DashboardContent() {
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
         body: JSON.stringify({
-          url: urlToProcess.trim(),
+          url: trimmedUrl,
           style,
           formats: selectedFormats,
         }),
@@ -138,6 +154,7 @@ function DashboardContent() {
           message: json.error || 'Failed to process YouTube video.',
           code: json.code,
         });
+        activeRequestIdRef.current = null;
         setIsLoading(false);
 
         // Refresh usage count from server
@@ -156,6 +173,7 @@ function DashboardContent() {
       if (user) {
         saveBrief(json.data, user.id);
       }
+      activeRequestIdRef.current = null;
       setIsLoading(false);
 
       // Update usage count from server response
@@ -189,21 +207,33 @@ function DashboardContent() {
         message: userFriendlyMessage,
         code: isAbort ? 'TIMEOUT' : 'ANALYSIS_FAILED',
       });
+      activeRequestIdRef.current = null;
       setIsLoading(false);
     }
   }, [style, selectedFormats, user]);
 
-  // 2. Auto-run analysis if URL passed in search params
+  // 2. Auto-run analysis if URL passed in search params (Guarded against duplicate calls)
   useEffect(() => {
-    if (user && initialUrl && isValidYoutubeUrl(initialUrl) && !resultData && !isLoading) {
+    if (
+      user &&
+      initialUrl &&
+      isValidYoutubeUrl(initialUrl) &&
+      !resultData &&
+      !isLoading &&
+      activeRequestIdRef.current === null &&
+      autoAnalyzedUrlRef.current !== initialUrl
+    ) {
+      autoAnalyzedUrlRef.current = initialUrl;
       handleAnalyze(initialUrl);
     }
   }, [user, initialUrl, resultData, isLoading, handleAnalyze]);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    if (isLoading || activeRequestIdRef.current !== null) return;
     handleAnalyze(youtubeUrl);
   };
+
 
   const handleFormatToggle = (format: OutputFormat) => {
     if (selectedFormats.includes(format)) {
@@ -385,7 +415,8 @@ function DashboardContent() {
         )}
 
         {/* LOADING ANIMATED PROGRESS STATE */}
-        {isLoading && <ProgressState />}
+        {isLoading && <ProgressState requestId={activeRequestId} />}
+
 
         {/* ERROR HANDLING UI CARDS */}
         {errorInfo && !isLoading && (

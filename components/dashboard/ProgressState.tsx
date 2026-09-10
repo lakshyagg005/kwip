@@ -16,12 +16,19 @@ const STAGES: ProgressStage[] = [
   { id: 'assets', label: 'Preparing your carousel & PDF' },
 ];
 
-export const ProgressState: React.FC = () => {
+interface ProgressStateProps {
+  requestId?: string | null;
+}
+
+export const ProgressState: React.FC<ProgressStateProps> = ({ requestId }) => {
   const [currentStageIndex, setCurrentStageIndex] = useState(0);
-  const [percent, setPercent] = useState(15);
+  const [percent, setPercent] = useState(10);
 
   useEffect(() => {
-    // Smooth, realistic progress simulation through pipeline stages
+    // Reset stage index and percentage ONCE per unique request ID
+    setCurrentStageIndex(0);
+    setPercent(10);
+
     const stageTimer = setInterval(() => {
       setCurrentStageIndex((prev) => {
         if (prev < STAGES.length - 1) {
@@ -35,7 +42,7 @@ export const ProgressState: React.FC = () => {
       setPercent((prev) => {
         if (prev < 92) {
           // Increment progress smoothly up to 92% until complete response lands
-          const step = Math.floor(Math.random() * 4) + 2;
+          const step = Math.floor(Math.random() * 3) + 2;
           return Math.min(prev + step, 92);
         }
         return prev;
@@ -46,7 +53,7 @@ export const ProgressState: React.FC = () => {
       clearInterval(stageTimer);
       clearInterval(percentTimer);
     };
-  }, []);
+  }, [requestId]);
 
   const currentStage = STAGES[currentStageIndex];
 
