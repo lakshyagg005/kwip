@@ -27,13 +27,16 @@ const PROVIDERS: ProviderConfig[] = [
     name: 'Groq',
     apiKeyEnv: 'GROQ_API_KEY',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
-    // Only confirmed-active Groq models that support response_format: json_object.
-    // openai/gpt-oss-20b removed: returns json_validate_failed 400 (requires full JSON Schema, not json_object mode).
+    // supportsJsonMode: false — do NOT send response_format to Groq.
+    // When response_format: json_object is set, Groq validates the model's JSON output
+    // server-side and returns 400 json_validate_failed if output is even slightly malformed.
+    // Without response_format, models return plain JSON text which sanitizeJsonString
+    // extracts cleanly. This is the same strategy used for OpenRouter/NVIDIA.
     models: [
-      'openai/gpt-oss-120b',   // primary — confirmed 200 in production, supports json_object
-      'llama3-groq-8b-8192',   // secondary — stable, fast, confirmed json_object support
+      'openai/gpt-oss-120b',  // primary — confirmed 200 in production
+      'openai/gpt-oss-20b',   // secondary — confirmed 200 in production
     ],
-    supportsJsonMode: true,
+    supportsJsonMode: false,
   },
   {
     name: 'OpenRouter',
