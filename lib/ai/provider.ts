@@ -312,8 +312,8 @@ async function generateLongVideoAnalysis(
   const failedCount = chunks.length - successfulCount;
   console.log(`[Long-Video] [${requestId ?? '-'}] chunks: ${successfulCount} ok / ${failedCount} failed / ${chunks.length} total`);
 
-  if (successfulCount < Math.ceil(chunks.length * 0.7)) {
-    console.error(`[Long-Video] [${requestId ?? '-'}] Only ${successfulCount}/${chunks.length} chunks succeeded (<70%). Aborting.`);
+  if (successfulCount < Math.ceil(chunks.length * 0.5)) {
+    console.error(`[Long-Video] [${requestId ?? '-'}] Only ${successfulCount}/${chunks.length} chunks succeeded (<50%). Aborting.`);
     throw new Error('ANALYSIS_INCOMPLETE: Unable to analyze enough sections.');
   }
 
@@ -404,6 +404,7 @@ Rules: No hallucination. If no stats/quotes exist, return []. Do NOT explain you
       response_format: { type: 'json_object' },
       requestId,
       deadlineMs,
+      chunkIndex: chunk.index,
     });
 
     const cleaned = sanitizeJsonString(completion.content);

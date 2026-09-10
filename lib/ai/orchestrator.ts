@@ -25,6 +25,13 @@ export interface ProviderConfig {
   endpoint: string;
   defaultModel: string;
   extraHeaders?: Record<string, string>;
+  /**
+   * Whether this provider's model supports response_format: { type: 'json_object' }.
+   * OpenRouter free-tier models and NVIDIA NIM reject this field with 4xx.
+   * When false, response_format is stripped from the request body and the
+   * existing prompt instructions + sanitizeJsonString handle JSON extraction.
+   */
+  supportsJsonMode?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -43,12 +50,16 @@ const PROVIDERS: ProviderConfig[] = [
     apiKeyEnv: 'GROQ_API_KEY',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
     defaultModel: 'openai/gpt-oss-120b',
+    supportsJsonMode: true,
   },
   {
     name: 'OpenRouter',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
+    // Free-tier models do not support response_format: json_object.
+    // JSON is extracted via sanitizeJsonString from plain-text output.
     defaultModel: 'meta-llama/llama-3.3-70b-instruct:free',
+    supportsJsonMode: false,
     extraHeaders: {
       'HTTP-Referer': 'https://kwip-brown.vercel.app/',
       'X-Title': 'KWIP Visual Summary Engine',
@@ -58,7 +69,9 @@ const PROVIDERS: ProviderConfig[] = [
     name: 'NVIDIA NIM',
     apiKeyEnv: 'NVIDIA_API_KEY',
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
-    defaultModel: 'meta/llama-3.2-11b-vision-instruct',
+    // Use a capable instruction-tuned text model. Does not support json_object mode.
+    defaultModel: 'meta/llama-3.3-70b-instruct',
+    supportsJsonMode: false,
   },
 ];
 
@@ -185,12 +198,17 @@ export async function executeAICompletion(
       ...(provider.extraHeaders || {}),
     };
 
+    // Only send response_format to providers that support json_object mode.
+    // OpenRouter free-tier and NVIDIA reject it with 4xx, causing chunks to fail.
+    // Prompt instructions + sanitizeJsonString handle JSON extraction for these providers.
+    const includeJsonMode = options.response_format && provider.supportsJsonMode === true;
+
     const body = JSON.stringify({
       model,
       messages: options.messages,
       temperature: options.temperature ?? 0.2,
       max_tokens: options.max_tokens ?? 1800,
-      ...(options.response_format ? { response_format: options.response_format } : {}),
+      ...(includeJsonMode ? { response_format: options.response_format } : {}),
     });
 
     // ---- Attempt helper (DRY) ----
