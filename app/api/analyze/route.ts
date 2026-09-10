@@ -198,6 +198,10 @@ export async function POST(req: NextRequest) {
       statusCode = 503;
       errorCode = 'ANALYSIS_INCOMPLETE';
       userFriendlyMessage = 'Unable to analyze enough sections of this video due to temporary rate limits. Please try again in a few moments.';
+    } else if (error.message?.includes('AI_INVALID_OUTPUT')) {
+      statusCode = 503;
+      errorCode = 'AI_INVALID_OUTPUT';
+      userFriendlyMessage = 'AI service returned an invalid or incomplete response structure. Please try again in a few moments.';
     } else if (error.message?.includes('AI_ALL_PROVIDERS_FAILED')) {
       statusCode = 503;
       errorCode = 'AI_ALL_PROVIDERS_FAILED';

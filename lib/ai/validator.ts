@@ -91,13 +91,13 @@ export function validateAnalysisResult(data: Partial<KwipAnalysisResult>): Valid
     }
   }
 
-  // 7. Title repetition check: Core thesis and executive summary must NOT restate title
+  // 7. Title repetition check: Core thesis and executive summary must NOT be identical to video title
   const videoTitleLower = (data.source?.videoTitle || data.title || '').trim().toLowerCase();
   if (videoTitleLower.length > 8) {
-    if (hookLower === videoTitleLower || (hookLower.includes(videoTitleLower) && hookLower.length - videoTitleLower.length < 15)) {
+    if (hookLower === videoTitleLower) {
       return { valid: false, reason: 'Core thesis repeats or restates the video title' };
     }
-    if (summaryLower === videoTitleLower || (summaryLower.includes(videoTitleLower) && summaryLower.length - videoTitleLower.length < 15)) {
+    if (summaryLower === videoTitleLower) {
       return { valid: false, reason: 'Executive summary repeats or restates the video title' };
     }
   }

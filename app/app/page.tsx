@@ -428,7 +428,7 @@ function DashboardContent() {
             <h3 className="text-base sm:text-lg font-bold text-slate-900 dark:text-slate-100">
               {errorInfo.code === 'USER_LIMIT_REACHED'
                 ? "You've reached your monthly free limit"
-                : errorInfo.code === 'UPSTREAM_RATE_LIMIT' || errorInfo.code === 'AI_ALL_PROVIDERS_FAILED'
+                : errorInfo.code === 'UPSTREAM_RATE_LIMIT' || errorInfo.code === 'AI_ALL_PROVIDERS_FAILED' || errorInfo.code === 'AI_INVALID_OUTPUT'
                 ? 'KWIP is temporarily at capacity'
                 : errorInfo.code === 'INVALID_YOUTUBE_URL'
                 ? "That doesn't look like a valid YouTube link"

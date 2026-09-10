@@ -165,26 +165,33 @@ ${preparedText}`;
       { role: 'user', content: userPrompt },
     ],
     temperature: 0.2,
-    // Direct analysis: schema output is ~1200–1800 tokens; cap at 2400 for safety
     max_tokens: 2400,
+    response_format: { type: 'json_object' },
     requestId,
     deadlineMs,
   });
 
+  const rid = requestId ?? '-';
+  console.log(`[AI] requestId=${rid} provider=${completion.providerName} status=200 contentLength=${completion.content.length}`);
+
   let cleanedJson = sanitizeJsonString(completion.content);
   let parsedData: any;
+  let parseSuccess = true;
 
   try {
     parsedData = JSON.parse(cleanedJson);
   } catch (parseError) {
-    console.error(`[${requestId ?? '-'}] Failed to parse JSON from AI model (${completion.providerName}):`, parseError);
+    parseSuccess = false;
+    console.error(`[AI_PARSE] requestId=${rid} success=false provider=${completion.providerName} error:`, parseError);
     parsedData = {};
   }
+  console.log(`[AI_PARSE] requestId=${rid} success=${parseSuccess}`);
 
   let valCheck = validateAnalysisResult(parsedData);
+  console.log(`[AI_VALIDATION] requestId=${rid} success=${valCheck.valid} reason="${valCheck.reason || ''}"`);
 
   if (!valCheck.valid) {
-    console.warn(`[${requestId ?? '-'}] [Validator] Initial output failed validation (${valCheck.reason}). Retrying with targeted prompt...`);
+    console.warn(`[AI_VALIDATION] requestId=${rid} Initial output failed validation (${valCheck.reason}). Retrying with targeted prompt...`);
 
     const retryPrompt = `${userPrompt}
 
@@ -204,6 +211,7 @@ Please re-analyze the transcript and ensure:
         ],
         temperature: 0.2,
         max_tokens: 2400,
+        response_format: { type: 'json_object' },
         requestId,
         deadlineMs,
       });
@@ -212,20 +220,30 @@ Please re-analyze the transcript and ensure:
       try {
         const retryParsed = JSON.parse(cleanedJson);
         const retryValCheck = validateAnalysisResult(retryParsed);
+        console.log(`[AI_VALIDATION_RETRY] requestId=${rid} success=${retryValCheck.valid} reason="${retryValCheck.reason || ''}"`);
 
         if (retryValCheck.valid) {
           parsedData = retryParsed;
           valCheck = retryValCheck;
         }
       } catch (retryParseErr) {
-        console.warn(`[${requestId ?? '-'}] [Validator] Retry JSON parse failed:`, retryParseErr);
+        console.warn(`[AI_PARSE_RETRY] requestId=${rid} Retry JSON parse failed:`, retryParseErr);
       }
     } catch (retryErr) {
-      console.warn(`[${requestId ?? '-'}] [Validator] Retry completion failed:`, retryErr);
+      console.warn(`[AI_RETRY] requestId=${rid} Retry completion failed:`, retryErr);
     }
   }
 
   const sanitizedData = sanitizeAndRepairParsedData(parsedData, metadata.videoTitle);
+
+  if (!sanitizedData) {
+    console.error(`[ANALYSIS] requestId=${rid} FAILED: sanitized output is incomplete or missing required fields.`);
+    throw new Error('AI_INVALID_OUTPUT: Generated analysis is missing required core sections.');
+  }
+
+  console.log(
+    `[ANALYSIS] requestId=${rid} concepts=${sanitizedData.keyIdeas?.length ?? 0} metrics=${sanitizedData.statistics?.length ?? 0} examples=${sanitizedData.keyIdeas?.filter((i: any) => i.example).length ?? 0} takeaways=${sanitizedData.actionSteps?.length ?? 0} quotes=${sanitizedData.quotes?.length ?? 0}`
+  );
 
   return {
     id: 'kwip_' + Math.random().toString(36).substring(2, 9),
@@ -299,6 +317,11 @@ async function generateLongVideoAnalysis(
 
   const sanitizedData = sanitizeAndRepairParsedData(synthesizedData, metadata.videoTitle);
 
+  if (!sanitizedData) {
+    console.error(`[Long-Video] [${requestId ?? '-'}] FAILED: synthesized output is incomplete or missing required fields.`);
+    throw new Error('ANALYSIS_INCOMPLETE: Synthesized output was incomplete or contained invalid format.');
+  }
+
   return {
     id: 'kwip_' + Math.random().toString(36).substring(2, 9),
     createdAt: new Date().toISOString(),
@@ -370,6 +393,7 @@ Rules: No hallucination. If no stats/quotes exist, return []. Do NOT explain you
       ],
       temperature: 0.2,
       max_tokens: 1500,
+      response_format: { type: 'json_object' },
       requestId,
       deadlineMs,
     });
@@ -429,8 +453,8 @@ JSON SCHEMA:
         { role: 'user', content: userPrompt },
       ],
       temperature: 0.2,
-      // Synthesis schema output is ~1500–2500 tokens; cap at 3200 for safety
       max_tokens: 3200,
+      response_format: { type: 'json_object' },
       requestId,
       deadlineMs,
     });
@@ -447,31 +471,46 @@ JSON SCHEMA:
     console.warn(`[Synthesizer] [${requestId ?? '-'}] AI call failed, using local fallback:`, err);
   }
 
-  // Local fallback — merge chunk results without AI
+  // Local fallback — merge section chunk evidence directly without fabricating content
   const mergedKeyIdeas = chunkResults.flatMap((c) => c.keyIdeas);
   const mergedStats = chunkResults.flatMap((c) => c.statistics);
   const mergedQuotes = chunkResults.flatMap((c) => c.quotes);
   const mergedActions = chunkResults.flatMap((c) => c.actionSteps);
 
-  const deduplicatedIdeas = mergedKeyIdeas.slice(0, 10).map((idea, idx) => ({
-    number: idx + 1,
-    title: idea.title || `Core Insight ${idx + 1}`,
-    summary: idea.summary || idea.explanation || 'Key takeaway from video section.',
-    explanation: idea.explanation || idea.summary || 'Detailed insight from video discussion.',
-    example: idea.example,
-    tag: idea.tag || 'Insight',
-  }));
+  const deduplicatedIdeas = mergedKeyIdeas
+    .filter((idea) => idea && idea.title && (idea.summary || idea.explanation))
+    .slice(0, 10)
+    .map((idea, idx) => ({
+      number: idx + 1,
+      title: idea.title.trim(),
+      summary: (idea.summary || idea.explanation || '').trim(),
+      explanation: (idea.explanation || idea.summary || '').trim(),
+      example: idea.example,
+      tag: idea.tag || 'Insight',
+    }));
+
+  if (deduplicatedIdeas.length < 2) {
+    throw new Error('ANALYSIS_INCOMPLETE: Insufficient valid section evidence for synthesis.');
+  }
+
+  const hookText = deduplicatedIdeas[0]?.summary || deduplicatedIdeas[0]?.explanation || '';
+  const execSummaryText = deduplicatedIdeas.slice(0, 3).map((i) => i.summary).join(' ');
+  const finalTakeawayText = mergedActions[0]?.action || deduplicatedIdeas[deduplicatedIdeas.length - 1]?.summary || '';
+
+  if (!hookText || !execSummaryText || !finalTakeawayText) {
+    throw new Error('ANALYSIS_INCOMPLETE: Insufficient valid section evidence for synthesis.');
+  }
 
   return {
     contentType: 'educational',
     title: metadata.videoTitle,
-    hook: deduplicatedIdeas[0]?.summary || 'Core insight from source material.',
-    executiveSummary: deduplicatedIdeas.slice(0, 3).map((i) => i.summary).join(' ') || 'Synthesis of key ideas from this video.',
+    hook: hookText,
+    executiveSummary: execSummaryText,
     keyIdeas: deduplicatedIdeas,
     statistics: mergedStats.slice(0, 4),
     quotes: mergedQuotes.slice(0, 3),
     actionSteps: mergedActions.slice(0, 4),
-    finalTakeaway: mergedActions[0]?.action || deduplicatedIdeas[deduplicatedIdeas.length - 1]?.summary || 'Primary recommendation from source analysis.',
+    finalTakeaway: finalTakeawayText,
   };
 }
 
@@ -558,8 +597,8 @@ export function isTitleCopyOrGeneric(text: string | undefined, title: string): b
     return true;
   }
 
-  // If text contains the exact video title (and video title is longer than 5 chars), treat as title copy
-  if (lowerTitle.length > 5 && lower.includes(lowerTitle)) {
+  // Only reject if text is literally identical to the video title or 'title: <title>'
+  if (lowerTitle.length > 5 && (lower === lowerTitle || lower === `title: ${lowerTitle}`)) {
     return true;
   }
 
@@ -573,15 +612,16 @@ export function sanitizeAndRepairParsedData(data: any, fallbackTitle: string): a
 
   const validKeyIdeas = Array.isArray(data?.keyIdeas) && data.keyIdeas.length > 0
     ? data.keyIdeas
-        .filter((idea: any) => idea && idea.title && !isPlaceholderText(idea.title) && !isPlaceholderText(idea.summary))
+        .filter((idea: any) => idea && idea.title && (idea.summary || idea.explanation) && !isPlaceholderText(idea.title) && !isPlaceholderText(idea.summary || ''))
         .map((idea: any, idx: number) => ({
           number: idx + 1,
           title: idea.title.trim(),
-          summary: idea.summary?.trim() || idea.explanation?.trim() || 'Key concept from source material.',
-          explanation: idea.explanation?.trim() || idea.summary?.trim() || 'Detailed insight from source transcript.',
+          summary: (idea.summary || idea.explanation || '').trim(),
+          explanation: (idea.explanation || idea.summary || '').trim(),
           example: idea.example && !isPlaceholderText(idea.example) ? idea.example.trim() : undefined,
           tag: idea.tag && !isPlaceholderText(idea.tag) ? idea.tag.trim() : 'Insight',
         }))
+        .filter((idea: any) => idea.title.length >= 3 && idea.summary.length >= 8)
     : [];
 
   const validActions = Array.isArray(data?.actionSteps)
@@ -590,17 +630,23 @@ export function sanitizeAndRepairParsedData(data: any, fallbackTitle: string): a
 
   let cleanHook = data?.hook?.trim();
   if (isTitleCopyOrGeneric(cleanHook, cleanTitle)) {
-    cleanHook = validKeyIdeas[0]?.summary || validKeyIdeas[0]?.explanation || 'Core lesson derived directly from transcript content.';
+    cleanHook = validKeyIdeas[0]?.summary || validKeyIdeas[0]?.explanation || '';
   }
 
   let cleanExecutiveSummary = data?.executiveSummary?.trim();
   if (isTitleCopyOrGeneric(cleanExecutiveSummary, cleanTitle)) {
-    cleanExecutiveSummary = validKeyIdeas.slice(0, 3).map((i: any) => i.summary).join(' ') || 'Synthesis of core ideas and insights presented in the source video.';
+    cleanExecutiveSummary = validKeyIdeas.slice(0, 3).map((i: any) => i.summary).join(' ');
   }
 
   let cleanFinalTakeaway = data?.finalTakeaway?.trim();
   if (isTitleCopyOrGeneric(cleanFinalTakeaway, cleanTitle)) {
-    cleanFinalTakeaway = validActions[0]?.action || validKeyIdeas[validKeyIdeas.length - 1]?.summary || 'Primary recommendation derived directly from source analysis.';
+    cleanFinalTakeaway = validActions[0]?.action || validKeyIdeas[validKeyIdeas.length - 1]?.summary || '';
+  }
+
+  // Reject incomplete analysis instead of substituting fake placeholder text
+  if (!cleanHook || cleanHook.length < 15 || !cleanExecutiveSummary || cleanExecutiveSummary.length < 25 || validKeyIdeas.length < 2 || !cleanFinalTakeaway || cleanFinalTakeaway.length < 10) {
+    console.error(`[Sanitizer] Rejecting incomplete AI analysis: hookLen=${cleanHook?.length ?? 0} execSumLen=${cleanExecutiveSummary?.length ?? 0} keyIdeas=${validKeyIdeas.length}`);
+    return null;
   }
 
   const validStatistics = Array.isArray(data?.statistics)
