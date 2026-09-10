@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { executeAICompletion } from './orchestrator';
-import { validateAnalysisResult } from './validator';
+import { validateAnalysisResult, cleanGenericPrefix } from './validator';
 import { splitTranscriptIntoChunks, TranscriptChunk } from './chunker';
 import { KwipAnalysisResult, TemplateStyle, OutputFormat, SourceMetadata, KeyIdea, Statistic, Quote, ActionStep } from '@/types/kwip';
 import { normalizeDurationToSeconds } from '@/lib/youtube';
@@ -210,7 +210,7 @@ Please re-analyze the transcript and ensure:
 4. Output strictly valid JSON matching the schema without codeblocks.`;
 
     try {
-      completion = await executeAICompletion({
+      const retryCompletion = await executeAICompletion({
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: retryPrompt },
@@ -222,13 +222,13 @@ Please re-analyze the transcript and ensure:
         deadlineMs,
       });
 
-      cleanedJson = sanitizeJsonString(completion.content);
+      const retryCleanedJson = sanitizeJsonString(retryCompletion.content);
       try {
-        const retryParsed = JSON.parse(cleanedJson);
+        const retryParsed = JSON.parse(retryCleanedJson);
         const retryValCheck = validateAnalysisResult(retryParsed);
         console.log(`[AI_VALIDATION_RETRY] requestId=${rid} success=${retryValCheck.valid} reason="${retryValCheck.reason || ''}"`);
 
-        if (retryValCheck.valid) {
+        if (retryValCheck.valid || Object.keys(retryParsed).length > Object.keys(parsedData).length) {
           parsedData = retryParsed;
           valCheck = retryValCheck;
         }
@@ -588,25 +588,12 @@ function isPlaceholderText(text: string | undefined): boolean {
 
 export function isTitleCopyOrGeneric(text: string | undefined, title: string): boolean {
   if (!text) return true;
-  const trimmed = text.trim();
-  if (trimmed.length < 10) return true;
-  if (isPlaceholderText(trimmed)) return true;
+  const cleaned = cleanGenericPrefix(text);
+  if (cleaned.length < 8) return true;
+  if (isPlaceholderText(cleaned)) return true;
 
-  const lower = trimmed.toLowerCase();
+  const lower = cleaned.toLowerCase();
   const lowerTitle = title.trim().toLowerCase();
-
-  // Check forbidden starting or boilerplate phrases
-  if (
-    lower.startsWith('this video') ||
-    lower.startsWith('an in-depth synthesis of') ||
-    lower.startsWith('core thesis and primary lessons from') ||
-    lower.startsWith('in this video') ||
-    lower.startsWith('this summary') ||
-    lower.startsWith('an executive summary synthesizing') ||
-    lower.startsWith('apply these core insights from')
-  ) {
-    return true;
-  }
 
   // Only reject if text is literally identical to the video title or 'title: <title>'
   if (lowerTitle.length > 5 && (lower === lowerTitle || lower === `title: ${lowerTitle}`)) {
@@ -617,6 +604,8 @@ export function isTitleCopyOrGeneric(text: string | undefined, title: string): b
 }
 
 export function sanitizeAndRepairParsedData(data: any, fallbackTitle: string): any {
+  if (!data || typeof data !== 'object') return null;
+
   const cleanTitle = data?.title && data.title.trim().length > 3 && !isPlaceholderText(data.title)
     ? data.title.trim()
     : fallbackTitle;
@@ -632,30 +621,30 @@ export function sanitizeAndRepairParsedData(data: any, fallbackTitle: string): a
           example: idea.example && !isPlaceholderText(idea.example) ? idea.example.trim() : undefined,
           tag: idea.tag && !isPlaceholderText(idea.tag) ? idea.tag.trim() : 'Insight',
         }))
-        .filter((idea: any) => idea.title.length >= 3 && idea.summary.length >= 8)
+        .filter((idea: any) => idea.title.length >= 2 && idea.summary.length >= 5)
     : [];
 
   const validActions = Array.isArray(data?.actionSteps)
     ? data.actionSteps.filter((a: any) => a && a.action && !isPlaceholderText(a.action))
     : [];
 
-  let cleanHook = data?.hook?.trim();
-  if (isTitleCopyOrGeneric(cleanHook, cleanTitle)) {
-    cleanHook = validKeyIdeas[0]?.summary || validKeyIdeas[0]?.explanation || '';
+  let cleanHook = cleanGenericPrefix(data?.hook);
+  if (isTitleCopyOrGeneric(cleanHook, cleanTitle) || cleanHook.length < 10) {
+    cleanHook = validKeyIdeas[0]?.summary || validKeyIdeas[0]?.explanation || cleanTitle;
   }
 
-  let cleanExecutiveSummary = data?.executiveSummary?.trim();
-  if (isTitleCopyOrGeneric(cleanExecutiveSummary, cleanTitle)) {
-    cleanExecutiveSummary = validKeyIdeas.slice(0, 3).map((i: any) => i.summary).join(' ');
+  let cleanExecutiveSummary = cleanGenericPrefix(data?.executiveSummary);
+  if (isTitleCopyOrGeneric(cleanExecutiveSummary, cleanTitle) || cleanExecutiveSummary.length < 15) {
+    cleanExecutiveSummary = validKeyIdeas.slice(0, 3).map((i: any) => i.summary).join(' ') || cleanHook;
   }
 
-  let cleanFinalTakeaway = data?.finalTakeaway?.trim();
-  if (isTitleCopyOrGeneric(cleanFinalTakeaway, cleanTitle)) {
-    cleanFinalTakeaway = validActions[0]?.action || validKeyIdeas[validKeyIdeas.length - 1]?.summary || '';
+  let cleanFinalTakeaway = cleanGenericPrefix(data?.finalTakeaway);
+  if (isTitleCopyOrGeneric(cleanFinalTakeaway, cleanTitle) || cleanFinalTakeaway.length < 8) {
+    cleanFinalTakeaway = validActions[0]?.action || validKeyIdeas[validKeyIdeas.length - 1]?.summary || cleanHook;
   }
 
-  // Reject incomplete analysis instead of substituting fake placeholder text
-  if (!cleanHook || cleanHook.length < 15 || !cleanExecutiveSummary || cleanExecutiveSummary.length < 25 || validKeyIdeas.length < 2 || !cleanFinalTakeaway || cleanFinalTakeaway.length < 10) {
+  // Reject incomplete analysis only if validKeyIdeas is empty AND cleanHook is missing/too short
+  if (validKeyIdeas.length === 0 && (!cleanHook || cleanHook.length < 10)) {
     console.error(`[Sanitizer] Rejecting incomplete AI analysis: hookLen=${cleanHook?.length ?? 0} execSumLen=${cleanExecutiveSummary?.length ?? 0} keyIdeas=${validKeyIdeas.length}`);
     return null;
   }
