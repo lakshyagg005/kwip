@@ -7,7 +7,17 @@ import { checkIpRateLimit } from '@/lib/rate-limit';
 import { reserveQuota, refundQuota } from '@/lib/quota';
 import { saveAnalysisServer } from '@/lib/analyses';
 
+/** Returns the names of AI provider env vars that are currently configured (have a non-empty value). Never logs the values themselves. */
+function getConfiguredProviders(): { groq: boolean; openrouter: boolean; nvidia: boolean } {
+  return {
+    groq: !!(process.env.GROQ_API_KEY?.trim()),
+    openrouter: !!(process.env.OPENROUTER_API_KEY?.trim()),
+    nvidia: !!(process.env.NVIDIA_API_KEY?.trim()),
+  };
+}
+
 export async function POST(req: NextRequest) {
+  const requestId = Math.random().toString(36).slice(2, 10).toUpperCase();
   let userId: string | null = null;
   let quotaReserved = false;
 
@@ -92,22 +102,42 @@ export async function POST(req: NextRequest) {
 
     quotaReserved = true;
 
-    // 6. Execute AI Pipeline (Single-Flight Caching)
+    // 6. Validate AI provider configuration BEFORE consuming any Supadata credits
+    const providers = getConfiguredProviders();
+    console.log(
+      `[Analyze API] requestId=${requestId} videoId=${videoId} userId=${userId} providers: groq=${providers.groq} openrouter=${providers.openrouter} nvidia=${providers.nvidia}`
+    );
+
+    if (!providers.groq && !providers.openrouter && !providers.nvidia) {
+      console.error(`[Analyze API] requestId=${requestId} AI_CONFIG_MISSING – no provider keys are set. Aborting before transcript fetch.`);
+      return NextResponse.json(
+        {
+          error: 'AI service is not configured. Please contact support.',
+          code: 'AI_CONFIG_MISSING',
+        },
+        { status: 503 }
+      );
+    }
+
+    // 7. Execute AI Pipeline (Single-Flight Caching)
+    // Transcript is fetched ONCE outside runSingleFlight so it is shared across all AI chunk calls.
     const cacheKey = buildCacheKey(videoId, style);
 
     const result = await runSingleFlight(cacheKey, async () => {
+      console.log(`[Analyze API] requestId=${requestId} transcript fetch started videoId=${videoId}`);
       let youtubeData;
       try {
         youtubeData = await fetchYoutubeTranscript(url);
       } catch (transcriptError: any) {
         console.error(
-          `[Analyze API Transcript Error] videoId=${videoId}, code=${transcriptError.code || 'TRANSCRIPT_ERROR'}, statusCode=${transcriptError.statusCode || 422}, message="${transcriptError.message}"`
+          `[Analyze API] requestId=${requestId} transcript error videoId=${videoId} code=${transcriptError.code || 'TRANSCRIPT_ERROR'} status=${transcriptError.statusCode || 422} message="${transcriptError.message}"`
         );
         const err = new Error(transcriptError.message || 'Failed to retrieve YouTube transcript.');
         (err as any).code = transcriptError.code || 'TRANSCRIPT_ERROR';
         (err as any).statusCode = transcriptError.statusCode || 422;
         throw err;
       }
+      console.log(`[Analyze API] requestId=${requestId} transcript fetch complete videoId=${videoId} chars=${youtubeData.rawTranscript?.length ?? 0}`);
 
       return generateAIAnalysis(
         youtubeData.rawTranscript,
@@ -117,9 +147,10 @@ export async function POST(req: NextRequest) {
       );
     });
 
-    // 7. Save Analysis to Server & Supabase Database for User Library (Strict User Scoping)
+    // 8. Save Analysis to Server & Supabase Database for User Library (Strict User Scoping)
     await saveAnalysisServer(user.id, result, url.trim(), videoId, style, formats);
 
+    console.log(`[Analyze API] requestId=${requestId} success videoId=${videoId}`);
     return NextResponse.json({
       success: true,
       data: result,
@@ -149,11 +180,15 @@ export async function POST(req: NextRequest) {
       statusCode = 503;
       errorCode = 'YOUTUBE_IP_BLOCKED';
       userFriendlyMessage = 'YouTube temporarily restricted serverless access for this request. Please try again in a few moments.';
+    } else if (error.code === 'AI_CONFIG_MISSING') {
+      statusCode = 503;
+      errorCode = 'AI_CONFIG_MISSING';
+      userFriendlyMessage = 'AI service is not configured. Please contact support.';
     } else if (error.message?.includes('AI_ALL_PROVIDERS_FAILED')) {
       statusCode = 503;
       errorCode = 'AI_ALL_PROVIDERS_FAILED';
       userFriendlyMessage = 'KWIP is temporarily at capacity. Please try again in a few moments.';
-    } else if (error.message?.includes('PGRST') || error.message?.toLowerCase().includes('database')) {
+    } else if (error.message?.toLowerCase().includes('pgrst') || error.message?.toLowerCase().includes('database')) {
       statusCode = 500;
       errorCode = 'DATABASE_ERROR';
       userFriendlyMessage = 'A database error occurred while processing your request. Please try again.';
