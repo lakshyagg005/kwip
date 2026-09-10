@@ -8,14 +8,8 @@ export interface ProviderRequestOptions {
   temperature?: number;
   max_tokens?: number;
   response_format?: { type: 'json_object' | 'text' };
-  /** Optional per-request trace ID for log correlation. Never contains API keys. */
   requestId?: string;
-  /**
-   * Hard deadline: epoch ms by which this AI call must complete.
-   * If the call cannot START before deadline, the orchestrator throws immediately.
-   */
   deadlineMs?: number;
-  /** Optional chunk index for multi-chunk trace logging. */
   chunkIndex?: number;
 }
 
@@ -23,42 +17,33 @@ export interface ProviderConfig {
   name: string;
   apiKeyEnv: string;
   endpoint: string;
-  defaultModel: string;
+  models: string[];
   extraHeaders?: Record<string, string>;
-  /**
-   * Whether this provider's model supports response_format: { type: 'json_object' }.
-   * OpenRouter free-tier models and NVIDIA NIM reject this field with 4xx.
-   * When false, response_format is stripped from the request body and the
-   * existing prompt instructions + sanitizeJsonString handle JSON extraction.
-   */
   supportsJsonMode?: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// Provider registry — order determines priority (first = highest priority).
-//
-// Strategy:
-//   Groq 200      → return result immediately. OpenRouter = 0 calls.
-//   Groq 429/4xx  → set circuit-breaker, immediately cascade to OpenRouter.
-//                   NO sleep. NO retry on the same provider.
-//   OR  200       → return result immediately. NVIDIA = 0 calls.
-//   All fail      → throw AI_ALL_PROVIDERS_FAILED.
-// ---------------------------------------------------------------------------
 const PROVIDERS: ProviderConfig[] = [
   {
     name: 'Groq',
     apiKeyEnv: 'GROQ_API_KEY',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
-    defaultModel: 'openai/gpt-oss-120b',
+    models: [
+      'openai/gpt-oss-120b',
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
+      'gemma2-9b-it',
+    ],
     supportsJsonMode: true,
   },
   {
     name: 'OpenRouter',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
-    // Free-tier models do not support response_format: json_object.
-    // JSON is extracted via sanitizeJsonString from plain-text output.
-    defaultModel: 'meta-llama/llama-3.3-70b-instruct:free',
+    models: [
+      'meta-llama/llama-3.3-70b-instruct:free',
+      'google/gemma-3-27b-it:free',
+      'mistralai/mistral-7b-instruct:free',
+    ],
     supportsJsonMode: false,
     extraHeaders: {
       'HTTP-Referer': 'https://kwip-brown.vercel.app/',
@@ -69,58 +54,46 @@ const PROVIDERS: ProviderConfig[] = [
     name: 'NVIDIA NIM',
     apiKeyEnv: 'NVIDIA_API_KEY',
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
-    // Use a capable instruction-tuned text model. Does not support json_object mode.
-    defaultModel: 'meta/llama-3.3-70b-instruct',
+    models: ['meta/llama-3.3-70b-instruct'],
     supportsJsonMode: false,
   },
 ];
 
-// ---------------------------------------------------------------------------
-// Circuit Breaker — per-provider cooldown map (in-memory, per process).
-// ---------------------------------------------------------------------------
 const cooldownUntilMap = new Map<string, number>();
 
-/** Returns remaining cooldown seconds (0 if ready). */
-export function getProviderCooldown(providerName: string): number {
-  const until = cooldownUntilMap.get(providerName) || 0;
+function modelCooldownKey(providerName: string, model: string): string {
+  return `${providerName}:${model}`;
+}
+
+export function getProviderCooldown(providerName: string, model?: string): number {
+  const key = model ? modelCooldownKey(providerName, model) : providerName;
+  const until = cooldownUntilMap.get(key) || 0;
   const remaining = Math.ceil((until - Date.now()) / 1000);
   return remaining > 0 ? remaining : 0;
 }
 
-/** Place a provider on cooldown. */
-export function setProviderCooldown(providerName: string, durationSeconds: number): void {
+export function setProviderCooldown(providerName: string, durationSeconds: number, model?: string): void {
+  const key = model ? modelCooldownKey(providerName, model) : providerName;
   const until = Date.now() + durationSeconds * 1000;
-  cooldownUntilMap.set(providerName, until);
-  console.warn(`[CircuitBreaker] ${providerName} on cooldown for ${durationSeconds}s (until ${new Date(until).toISOString()}).`);
+  cooldownUntilMap.set(key, until);
+  console.warn(`[CircuitBreaker] ${providerName}${model ? `/${model}` : ''} on cooldown for ${durationSeconds}s.`);
 }
 
-/** Clear all cooldowns (for testing). */
 export function resetProviderCooldowns(): void {
   cooldownUntilMap.clear();
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Milliseconds remaining until deadline (negative = past deadline). */
 function msUntilDeadline(deadlineMs: number | undefined): number {
   if (!deadlineMs) return Infinity;
   return deadlineMs - Date.now();
 }
 
-/**
- * Parse rate-limit headers and return the recommended cooldown in seconds.
- * Used ONLY to set the circuit-breaker duration — we never sleep for this long.
- * Caps at 60s.
- */
 function parseRetryAfterSeconds(headers: Headers): number {
   const retryAfter = headers.get('retry-after');
   if (retryAfter) {
     const parsed = parseInt(retryAfter, 10);
     if (!isNaN(parsed) && parsed > 0) return Math.min(parsed, 60);
   }
-
   for (const hdr of ['x-ratelimit-reset-requests', 'x-ratelimit-reset-tokens']) {
     const val = headers.get(hdr);
     if (val) {
@@ -129,29 +102,9 @@ function parseRetryAfterSeconds(headers: Headers): number {
       if (!isNaN(parsed) && parsed > 0) return Math.min(Math.ceil(parsed), 60);
     }
   }
-
-  return 30; // conservative default cooldown for circuit breaker
+  return 30;
 }
 
-// ---------------------------------------------------------------------------
-// Core orchestrator
-// ---------------------------------------------------------------------------
-
-/**
- * Execute a single AI completion with provider fallback.
- *
- * Fallback policy (CRITICAL):
- * - Groq 200      → return immediately. OpenRouter = 0 calls.
- * - Groq 429      → set circuit-breaker, immediately continue to OpenRouter.
- *                   NO sleep. NO retry on the same provider.
- * - Groq 4xx      → immediately continue to next provider.
- * - Groq 5xx      → one 500ms retry, then cascade if still failing.
- * - OpenRouter 200 → return immediately. NVIDIA = 0 calls.
- * - All fail       → throw AI_ALL_PROVIDERS_FAILED.
- *
- * Circuit breaker: once a provider is 429'd, it is marked on cooldown.
- * Subsequent chunk calls in the same request skip it without sleeping.
- */
 export async function executeAICompletion(
   options: ProviderRequestOptions
 ): Promise<{ content: string; providerName: string; latencyMs: number }> {
@@ -160,15 +113,11 @@ export async function executeAICompletion(
   const errors: string[] = [];
 
   for (const provider of PROVIDERS) {
-    // ── Deadline check ──────────────────────────────────────────────────────
-    const remainingMs = msUntilDeadline(options.deadlineMs);
-    if (remainingMs < 5000) {
-      console.warn(`[Orchestrator] ${rid}${chunkTag} Deadline reached before trying ${provider.name}. Aborting.`);
+    if (msUntilDeadline(options.deadlineMs) < 5000) {
       errors.push(`${provider.name}: Deadline exceeded`);
       break;
     }
 
-    // ── API key check ────────────────────────────────────────────────────────
     const apiKey = process.env[provider.apiKeyEnv];
     if (!apiKey) {
       console.warn(`[Orchestrator] ${rid}${chunkTag} ${provider.name} skipped: ${provider.apiKeyEnv} not set.`);
@@ -176,140 +125,127 @@ export async function executeAICompletion(
       continue;
     }
 
-    // ── Circuit breaker — skip immediately, do NOT sleep ────────────────────
-    // If this provider was 429'd earlier in this request, skip it instantly.
-    const cooldownSec = getProviderCooldown(provider.name);
-    if (cooldownSec > 0) {
-      console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_SKIP] provider=${provider.name} reason=cooldown remaining=${cooldownSec}s`);
-      errors.push(`${provider.name}: On cooldown (${cooldownSec}s)`);
-      continue;
-    }
+    const includeJsonMode = !!options.response_format && provider.supportsJsonMode === true;
 
-    const model = provider.defaultModel;
-    const startTime = Date.now();
-
-    // Per-attempt timeout: min(25s, remaining_deadline - 2s buffer)
-    const perAttemptMs = Math.min(25000, Math.max(5000, msUntilDeadline(options.deadlineMs) - 2000));
-
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      ...(provider.extraHeaders || {}),
-    };
-
-    // Only send response_format to providers that support json_object mode.
-    // OpenRouter free-tier and NVIDIA reject it with 4xx, causing chunks to fail.
-    // Prompt instructions + sanitizeJsonString handle JSON extraction for these providers.
-    const includeJsonMode = options.response_format && provider.supportsJsonMode === true;
-
-    const body = JSON.stringify({
-      model,
-      messages: options.messages,
-      temperature: options.temperature ?? 0.2,
-      max_tokens: options.max_tokens ?? 1800,
-      ...(includeJsonMode ? { response_format: options.response_format } : {}),
-    });
-
-    // ---- Attempt helper (DRY) ----
-    const doFetch = async (): Promise<Response> => {
-      const controller = new AbortController();
-      const tid = setTimeout(() => controller.abort(), perAttemptMs);
-      try {
-        const resp = await fetch(provider.endpoint, { method: 'POST', headers, body, signal: controller.signal });
-        clearTimeout(tid);
-        return resp;
-      } catch (e) {
-        clearTimeout(tid);
-        throw e;
-      }
-    };
-
-    try {
-      console.log(`[Orchestrator] ${rid}${chunkTag} [AI_ATTEMPT] provider=${provider.name} model=${model} timeout=${Math.round(perAttemptMs / 1000)}s`);
-      let response = await doFetch();
-      const latencyMs = Date.now() - startTime;
-
-      // ── 429 Rate Limited ─────────────────────────────────────────────────
-      // KEY FIX: Do NOT wait. Do NOT retry on the same provider.
-      // Set circuit-breaker cooldown and immediately cascade to next provider.
-      if (response.status === 429) {
-        const cooldown = parseRetryAfterSeconds(response.headers);
-        console.warn(
-          `[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=429 latency=${latencyMs}ms`
-        );
-        console.warn(
-          `[Orchestrator] ${rid}${chunkTag} [AI_FALLBACK] provider=${provider.name} reason=429 cooldown=${cooldown}s → cascading to next provider immediately`
-        );
-        setProviderCooldown(provider.name, cooldown);
-        errors.push(`${provider.name} (${model}): 429 rate-limited → cascading`);
-        continue; // immediately try OpenRouter
+    for (const model of provider.models) {
+      const remainingMs = msUntilDeadline(options.deadlineMs);
+      if (remainingMs < 5000) {
+        errors.push(`${provider.name}/${model}: Deadline exceeded`);
+        break;
       }
 
-      // ── 4xx (not 429) ────────────────────────────────────────────────────
-      if (response.status >= 400 && response.status < 500) {
-        const errText = await response.text().catch(() => '');
-        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=${response.status} latency=${latencyMs}ms body=${errText.slice(0, 200)}`);
-        errors.push(`${provider.name} (${model}): HTTP ${response.status}`);
+      const cooldownSec = getProviderCooldown(provider.name, model);
+      if (cooldownSec > 0) {
+        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_SKIP] provider=${provider.name} model=${model} cooldown=${cooldownSec}s`);
+        errors.push(`${provider.name}/${model}: On cooldown`);
         continue;
       }
 
-      // ── 5xx — one retry after 500ms ──────────────────────────────────────
-      if (response.status >= 500) {
-        const errText = await response.text().catch(() => '');
-        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=${response.status} latency=${latencyMs}ms — retrying in 500ms`);
-        if (msUntilDeadline(options.deadlineMs) > 5000) {
-          await new Promise((r) => setTimeout(r, 500));
-          const retry = await doFetch();
-          if (!retry.ok) {
-            errors.push(`${provider.name} (${model}): HTTP ${retry.status} after 5xx retry`);
-            continue;
-          }
-          const retryJson = await retry.json();
-          const retryContent = retryJson?.choices?.[0]?.message?.content;
-          if (!retryContent || typeof retryContent !== 'string' || retryContent.trim().length === 0) {
-            errors.push(`${provider.name} (${model}): Empty response after 5xx retry`);
-            continue;
-          }
-          const retryLatency = Date.now() - startTime;
-          console.log(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=200 latency=${retryLatency}ms (after 5xx retry)`);
-          return { content: retryContent, providerName: `${provider.name} (${model})`, latencyMs: retryLatency };
+      const startTime = Date.now();
+      const perAttemptMs = Math.min(25000, Math.max(5000, remainingMs - 2000));
+
+      const headers: Record<string, string> = {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        ...(provider.extraHeaders || {}),
+      };
+
+      const body = JSON.stringify({
+        model,
+        messages: options.messages,
+        temperature: options.temperature ?? 0.2,
+        max_tokens: options.max_tokens ?? 1800,
+        ...(includeJsonMode ? { response_format: options.response_format } : {}),
+      });
+
+      const doFetch = async (): Promise<Response> => {
+        const controller = new AbortController();
+        const tid = setTimeout(() => controller.abort(), perAttemptMs);
+        try {
+          const resp = await fetch(provider.endpoint, { method: 'POST', headers, body, signal: controller.signal });
+          clearTimeout(tid);
+          return resp;
+        } catch (e) {
+          clearTimeout(tid);
+          throw e;
         }
-        errors.push(`${provider.name} (${model}): HTTP ${response.status}`);
+      };
+
+      try {
+        console.log(`[Orchestrator] ${rid}${chunkTag} [AI_ATTEMPT] provider=${provider.name} model=${model} timeout=${Math.round(perAttemptMs / 1000)}s`);
+        const response = await doFetch();
+        const latencyMs = Date.now() - startTime;
+
+        // 429 → per-model cooldown → try next model in SAME provider
+        if (response.status === 429) {
+          const cooldown = parseRetryAfterSeconds(response.headers);
+          console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=429 latency=${latencyMs}ms → cooldown=${cooldown}s next model`);
+          setProviderCooldown(provider.name, cooldown, model);
+          errors.push(`${provider.name}/${model}: 429`);
+          continue;
+        }
+
+        // 4xx → try next model
+        if (response.status >= 400 && response.status < 500) {
+          const errText = await response.text().catch(() => '');
+          console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=${response.status} latency=${latencyMs}ms body=${errText.slice(0, 200)}`);
+          errors.push(`${provider.name}/${model}: HTTP ${response.status}`);
+          continue;
+        }
+
+        // 5xx → one retry, then next model
+        if (response.status >= 500) {
+          console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=${response.status} retrying...`);
+          if (msUntilDeadline(options.deadlineMs) > 5000) {
+            await new Promise((r) => setTimeout(r, 500));
+            const retry = await doFetch();
+            if (retry.ok) {
+              const retryJson = await retry.json();
+              const retryContent = retryJson?.choices?.[0]?.message?.content;
+              if (retryContent && typeof retryContent === 'string' && retryContent.trim().length > 0) {
+                const retryLatency = Date.now() - startTime;
+                console.log(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=200 latency=${retryLatency}ms (5xx-retry)`);
+                return { content: retryContent, providerName: `${provider.name} (${model})`, latencyMs: retryLatency };
+              }
+            }
+          }
+          errors.push(`${provider.name}/${model}: HTTP ${response.status}`);
+          continue;
+        }
+
+        if (!response.ok) {
+          errors.push(`${provider.name}/${model}: HTTP ${response.status}`);
+          continue;
+        }
+
+        // 200 success
+        const json = await response.json();
+        const content = json?.choices?.[0]?.message?.content;
+
+        if (!content || typeof content !== 'string' || content.trim().length === 0) {
+          console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=200 empty`);
+          errors.push(`${provider.name}/${model}: Empty response`);
+          continue;
+        }
+
+        console.log(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=200 latency=${latencyMs}ms`);
+        return { content, providerName: `${provider.name} (${model})`, latencyMs };
+
+      } catch (err: any) {
+        const latencyMs = Date.now() - startTime;
+        const isAbort = err.name === 'AbortError' || err.message?.includes('aborted');
+        if (isAbort) {
+          console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=TIMEOUT latency=${latencyMs}ms`);
+          errors.push(`${provider.name}/${model}: Timeout`);
+        } else {
+          console.error(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} model=${model} status=ERROR error=${err.message || err}`);
+          errors.push(`${provider.name}/${model}: ${err.message || 'Network error'}`);
+        }
         continue;
       }
-
-      if (!response.ok) {
-        errors.push(`${provider.name} (${model}): HTTP ${response.status}`);
-        continue;
-      }
-
-      const json = await response.json();
-      const content = json?.choices?.[0]?.message?.content;
-
-      if (!content || typeof content !== 'string' || content.trim().length === 0) {
-        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=200 empty_content latency=${latencyMs}ms`);
-        errors.push(`${provider.name} (${model}): Empty response`);
-        continue;
-      }
-
-      console.log(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=200 latency=${latencyMs}ms`);
-      return { content, providerName: `${provider.name} (${model})`, latencyMs };
-
-    } catch (err: any) {
-      const latencyMs = Date.now() - startTime;
-      const isAbort = err.name === 'AbortError' || err.message?.includes('aborted');
-
-      if (isAbort) {
-        console.warn(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=TIMEOUT latency=${latencyMs}ms timeout=${Math.round(perAttemptMs / 1000)}s`);
-        errors.push(`${provider.name} (${model}): Timeout`);
-      } else {
-        console.error(`[Orchestrator] ${rid}${chunkTag} [AI_RESULT] provider=${provider.name} status=ERROR latency=${latencyMs}ms error=${err.message || err}`);
-        errors.push(`${provider.name} (${model}): ${err.message || 'Network error'}`);
-      }
-      continue;
-    }
-  }
+    } // end model loop
+  } // end provider loop
 
   throw new Error(`AI_ALL_PROVIDERS_FAILED: ${errors.join('; ')}`);
 }
