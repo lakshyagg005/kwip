@@ -8,10 +8,21 @@ export interface ValidationResult {
 export function cleanGenericPrefix(text: string | undefined): string {
   if (!text) return '';
   let cleaned = text.trim();
-  cleaned = cleaned.replace(
-    /^(in this video|this video|this summary|an in-depth synthesis of|an executive summary synthesizing|this presentation|in this tutorial|this guide)\s*(,|:|—|-)?\s*(we learn that|the speaker|speaker)?\s*(discusses|covers|explores|breaks down|provides|presents|synthesizes|explains|delves into|examines|outlines)?\s*(how|why|that|the|a|an)?\s*/i,
-    ''
-  ).trim();
+  const prefixes = [
+    /^in this video\s*(,|:|—|-)?\s*/i,
+    /^this video\s*(,|:|—|-)?\s*/i,
+    /^this summary\s*(,|:|—|-)?\s*/i,
+    /^an in-depth synthesis of\s*(,|:|—|-)?\s*/i,
+    /^an executive summary synthesizing\s*(,|:|—|-)?\s*/i,
+    /^this presentation\s*(,|:|—|-)?\s*/i,
+    /^in this tutorial\s*(,|:|—|-)?\s*/i,
+    /^this guide\s*(,|:|—|-)?\s*/i,
+  ];
+  for (const p of prefixes) {
+    cleaned = cleaned.replace(p, '').trim();
+  }
+  const verbs = /^(we learn that|the speaker|speaker)?\s*(discusses|covers|explores|breaks down|provides|presents|synthesizes|explains|delves into|examines|outlines)\s*(how|why|that|the)?\s*/i;
+  cleaned = cleaned.replace(verbs, '').trim();
   if (cleaned.length > 0) {
     cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
   }

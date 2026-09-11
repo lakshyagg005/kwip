@@ -22,11 +22,15 @@ export function splitTranscriptIntoChunks(
   rawTranscript: string,
   options: ChunkingOptions = {}
 ): TranscriptChunk[] {
-  const maxChunkChars = options.maxChunkChars ?? 10000;
-  const overlapChars = options.overlapChars ?? 1000;
+  const trimmed = rawTranscript.trim();
+  let maxChunkChars = options.maxChunkChars ?? 18000;
+  // Cap at 4-5 chunks max to avoid overwhelming API providers with 10+ sequential LLM calls
+  if (trimmed.length > maxChunkChars * 4) {
+    maxChunkChars = Math.ceil(trimmed.length / 4);
+  }
+  const overlapChars = options.overlapChars ?? 1500;
   const totalDuration = options.totalDurationSeconds || 0;
 
-  const trimmed = rawTranscript.trim();
   if (trimmed.length <= maxChunkChars) {
     return [
       {

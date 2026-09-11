@@ -27,14 +27,11 @@ const PROVIDERS: ProviderConfig[] = [
     name: 'Groq',
     apiKeyEnv: 'GROQ_API_KEY',
     endpoint: 'https://api.groq.com/openai/v1/chat/completions',
-    // supportsJsonMode: false — do NOT send response_format to Groq.
-    // When response_format: json_object is set, Groq validates the model's JSON output
-    // server-side and returns 400 json_validate_failed if output is even slightly malformed.
-    // Without response_format, models return plain JSON text which sanitizeJsonString
-    // extracts cleanly. This is the same strategy used for OpenRouter/NVIDIA.
     models: [
-      'openai/gpt-oss-120b',  // primary — confirmed 200 in production
-      'openai/gpt-oss-20b',   // secondary — confirmed 200 in production
+      'openai/gpt-oss-120b',
+      'openai/gpt-oss-20b',
+      'llama-3.3-70b-versatile',
+      'llama-3.1-8b-instant',
     ],
     supportsJsonMode: false,
   },
@@ -43,9 +40,9 @@ const PROVIDERS: ProviderConfig[] = [
     apiKeyEnv: 'OPENROUTER_API_KEY',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     models: [
-      'meta-llama/llama-3.3-70b-instruct:free',
-      'google/gemma-3-27b-it:free',
-      'mistralai/mistral-7b-instruct:free',
+      'meta-llama/llama-3.3-70b-instruct',
+      'google/gemini-2.0-flash-lite-001',
+      'openrouter/auto',
     ],
     supportsJsonMode: false,
     extraHeaders: {
@@ -57,7 +54,11 @@ const PROVIDERS: ProviderConfig[] = [
     name: 'NVIDIA NIM',
     apiKeyEnv: 'NVIDIA_API_KEY',
     endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
-    models: ['meta/llama-3.3-70b-instruct'],
+    models: [
+      'meta/llama-3.1-8b-instruct',
+      'meta/llama-3.2-3b-instruct',
+      'nvidia/nemotron-4-340b-instruct',
+    ],
     supportsJsonMode: false,
   },
 ];
@@ -69,9 +70,14 @@ function modelCooldownKey(providerName: string, model: string): string {
 }
 
 export function getProviderCooldown(providerName: string, model?: string): number {
-  const key = model ? modelCooldownKey(providerName, model) : providerName;
-  const until = cooldownUntilMap.get(key) || 0;
-  const remaining = Math.ceil((until - Date.now()) / 1000);
+  if (model) {
+    const modelUntil = cooldownUntilMap.get(modelCooldownKey(providerName, model)) || 0;
+    if (modelUntil > Date.now()) {
+      return Math.ceil((modelUntil - Date.now()) / 1000);
+    }
+  }
+  const providerUntil = cooldownUntilMap.get(providerName) || 0;
+  const remaining = Math.ceil((providerUntil - Date.now()) / 1000);
   return remaining > 0 ? remaining : 0;
 }
 

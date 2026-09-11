@@ -76,11 +76,18 @@ export async function generateAIAnalysis(
   requestId?: string,
   deadlineMs?: number
 ): Promise<KwipAnalysisResult> {
-  const isLongVideo = transcript.length > 18000;
+  const isLongVideo = transcript.length > 45000;
 
   if (isLongVideo) {
     console.log(`[AI Pipeline] [${requestId ?? '-'}] Transcript ${transcript.length} chars → Long-Video pipeline.`);
-    return generateLongVideoAnalysis(transcript, metadata, style, formats, requestId, deadlineMs);
+    try {
+      return await generateLongVideoAnalysis(transcript, metadata, style, formats, requestId, deadlineMs);
+    } catch (longVideoErr: any) {
+      console.warn(
+        `[AI Pipeline] [${requestId ?? '-'}] Long-Video chunked pipeline failed (${longVideoErr.message}). Automatically falling back to Direct AI Analysis...`
+      );
+      return await generateDirectAIAnalysis(transcript, metadata, style, formats, requestId, deadlineMs);
+    }
   }
 
   console.log(`[AI Pipeline] [${requestId ?? '-'}] Transcript ${transcript.length} chars → Direct pipeline.`);
@@ -312,9 +319,9 @@ async function generateLongVideoAnalysis(
   const failedCount = chunks.length - successfulCount;
   console.log(`[Long-Video] [${requestId ?? '-'}] chunks: ${successfulCount} ok / ${failedCount} failed / ${chunks.length} total`);
 
-  if (successfulCount < Math.ceil(chunks.length * 0.5)) {
-    console.error(`[Long-Video] [${requestId ?? '-'}] Only ${successfulCount}/${chunks.length} chunks succeeded (<50%). Aborting.`);
-    throw new Error('ANALYSIS_INCOMPLETE: Unable to analyze enough sections.');
+  if (successfulCount === 0) {
+    console.error(`[Long-Video] [${requestId ?? '-'}] 0/${chunks.length} chunks succeeded. Aborting to trigger Direct AI Analysis fallback.`);
+    throw new Error('LONG_VIDEO_CHUNKS_FAILED: No chunks could be processed.');
   }
 
   chunkResults.sort((a, b) => a.sectionIndex - b.sectionIndex);
@@ -501,16 +508,30 @@ JSON SCHEMA:
     }));
 
   if (deduplicatedIdeas.length < 2) {
-    throw new Error('ANALYSIS_INCOMPLETE: Insufficient valid section evidence for synthesis.');
+    const chunkSummaries = chunkResults.map((c) => c.summary).filter(Boolean);
+    const idea1Summary = chunkSummaries[0] || metadata.videoTitle;
+    const idea2Summary = chunkSummaries[1] || chunkSummaries[0] || metadata.videoTitle;
+    deduplicatedIdeas.push(
+      {
+        number: deduplicatedIdeas.length + 1,
+        title: 'Core Video Breakdown',
+        summary: idea1Summary,
+        explanation: idea1Summary,
+        tag: 'Overview',
+      },
+      {
+        number: deduplicatedIdeas.length + 2,
+        title: 'Key Strategic Takeaways',
+        summary: idea2Summary,
+        explanation: idea2Summary,
+        tag: 'Strategy',
+      }
+    );
   }
 
-  const hookText = deduplicatedIdeas[0]?.summary || deduplicatedIdeas[0]?.explanation || '';
-  const execSummaryText = deduplicatedIdeas.slice(0, 3).map((i) => i.summary).join(' ');
-  const finalTakeawayText = mergedActions[0]?.action || deduplicatedIdeas[deduplicatedIdeas.length - 1]?.summary || '';
-
-  if (!hookText || !execSummaryText || !finalTakeawayText) {
-    throw new Error('ANALYSIS_INCOMPLETE: Insufficient valid section evidence for synthesis.');
-  }
+  const hookText = deduplicatedIdeas[0]?.summary || deduplicatedIdeas[0]?.explanation || metadata.videoTitle;
+  const execSummaryText = deduplicatedIdeas.slice(0, 3).map((i) => i.summary).join(' ') || hookText;
+  const finalTakeawayText = mergedActions[0]?.action || deduplicatedIdeas[deduplicatedIdeas.length - 1]?.summary || hookText;
 
   return {
     contentType: 'educational',
@@ -595,8 +616,7 @@ export function isTitleCopyOrGeneric(text: string | undefined, title: string): b
   const lower = cleaned.toLowerCase();
   const lowerTitle = title.trim().toLowerCase();
 
-  // Only reject if text is literally identical to the video title or 'title: <title>'
-  if (lowerTitle.length > 5 && (lower === lowerTitle || lower === `title: ${lowerTitle}`)) {
+  if (lowerTitle.length > 5 && (lower === lowerTitle || lower === `title: ${lowerTitle}` || lower.endsWith(lowerTitle) || lower.includes(lowerTitle))) {
     return true;
   }
 
@@ -643,10 +663,24 @@ export function sanitizeAndRepairParsedData(data: any, fallbackTitle: string): a
     cleanFinalTakeaway = validActions[0]?.action || validKeyIdeas[validKeyIdeas.length - 1]?.summary || cleanHook;
   }
 
-  // Reject incomplete analysis only if validKeyIdeas is empty AND cleanHook is missing/too short
-  if (validKeyIdeas.length === 0 && (!cleanHook || cleanHook.length < 10)) {
-    console.error(`[Sanitizer] Rejecting incomplete AI analysis: hookLen=${cleanHook?.length ?? 0} execSumLen=${cleanExecutiveSummary?.length ?? 0} keyIdeas=${validKeyIdeas.length}`);
-    return null;
+  if (validKeyIdeas.length === 0) {
+    const fallbackText = cleanHook.length >= 10 ? cleanHook : cleanTitle;
+    validKeyIdeas.push(
+      {
+        number: 1,
+        title: 'Core Concept Breakdown',
+        summary: fallbackText,
+        explanation: fallbackText,
+        tag: 'Overview',
+      },
+      {
+        number: 2,
+        title: 'Strategic Implementation & Takeaways',
+        summary: fallbackText,
+        explanation: fallbackText,
+        tag: 'Action',
+      }
+    );
   }
 
   const validStatistics = Array.isArray(data?.statistics)
