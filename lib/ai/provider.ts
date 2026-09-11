@@ -517,6 +517,7 @@ JSON SCHEMA:
         title: 'Core Video Breakdown',
         summary: idea1Summary,
         explanation: idea1Summary,
+        example: undefined,
         tag: 'Overview',
       },
       {
@@ -524,6 +525,7 @@ JSON SCHEMA:
         title: 'Key Strategic Takeaways',
         summary: idea2Summary,
         explanation: idea2Summary,
+        example: undefined,
         tag: 'Strategy',
       }
     );
