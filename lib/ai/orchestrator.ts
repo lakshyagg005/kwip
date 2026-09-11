@@ -24,42 +24,20 @@ export interface ProviderConfig {
 
 const PROVIDERS: ProviderConfig[] = [
   {
-    name: 'Groq',
-    apiKeyEnv: 'GROQ_API_KEY',
-    endpoint: 'https://api.groq.com/openai/v1/chat/completions',
-    models: [
-      'openai/gpt-oss-120b',
-      'openai/gpt-oss-20b',
-      'llama-3.3-70b-versatile',
-      'llama-3.1-8b-instant',
-    ],
-    supportsJsonMode: false,
-  },
-  {
     name: 'OpenRouter',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     endpoint: 'https://openrouter.ai/api/v1/chat/completions',
     models: [
-      'meta-llama/llama-3.3-70b-instruct',
-      'google/gemini-2.0-flash-lite-001',
-      'openrouter/auto',
+      'meta-llama/llama-3.3-70b-instruct:free',
+      'google/gemini-2.0-flash-exp:free',
+      'meta-llama/llama-3.1-8b-instruct:free',
+      'openrouter/free',
     ],
     supportsJsonMode: false,
     extraHeaders: {
       'HTTP-Referer': 'https://kwip-brown.vercel.app/',
       'X-Title': 'KWIP Visual Summary Engine',
     },
-  },
-  {
-    name: 'NVIDIA NIM',
-    apiKeyEnv: 'NVIDIA_API_KEY',
-    endpoint: 'https://integrate.api.nvidia.com/v1/chat/completions',
-    models: [
-      'meta/llama-3.1-8b-instruct',
-      'meta/llama-3.2-3b-instruct',
-      'nvidia/nemotron-4-340b-instruct',
-    ],
-    supportsJsonMode: false,
   },
 ];
 
